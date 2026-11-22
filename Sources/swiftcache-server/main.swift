@@ -24,6 +24,7 @@ struct Server: ParsableCommand {
     @Option(help: "Comma-separated coordinator addresses (host:port,...).") var coordinators: String
     @Flag(help: "This process is one of the coordinators (needs --data-dir).") var coordinator = false
     @Option(help: "Directory for durable coordinator state.") var dataDir: String?
+    @Option(help: "Port for HTTP health probes (/ready, /live); 0 disables.") var healthPort: Int = 8080
 
     @Option(help: "Storage replicas per shard.") var replication: Int = 2
     @Option(help: "Transaction logs per generation.") var logs: Int = 3
@@ -64,9 +65,18 @@ struct Server: ParsableCommand {
         let finalConfig = config
         let nodeHost = try NodeHost(address: advertise, dataDirectory: dataDir, logLevel: level)
         nodeHost.log(.info, "\(advertise): class=\(cls) coordinator=\(isCoordinator) coordinators=\(coordinators)")
-        try nodeHost.run(bindHost: host, port: port) { env in
-            ServerProcess.make(env: env, processClass: cls, isCoordinator: isCoordinator,
-                               coordinators: coordinatorEndpoints, config: finalConfig)
+        let holder = ProcessHolder()
+        try nodeHost.run(bindHost: host, port: port, healthPort: healthPort == 0 ? nil : healthPort,
+                         isReady: { holder.process?.isReady ?? false }) { env in
+            let p = ServerProcess.make(env: env, processClass: cls, isCoordinator: isCoordinator,
+                                       coordinators: coordinatorEndpoints, config: finalConfig)
+            holder.process = p
+            return p
         }
     }
+}
+
+/// Lets the health endpoint reach the process (only touched on the process's event loop).
+final class ProcessHolder: @unchecked Sendable {
+    var process: ProcessHost?
 }

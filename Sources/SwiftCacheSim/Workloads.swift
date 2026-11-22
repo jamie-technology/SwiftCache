@@ -218,7 +218,16 @@ func scheduleChaos(_ sim: Simulator, options: SimulationOptions, until end: UInt
         guard let cc = sim.controller, cc.phase == .running else { return false }
         let st = cc.status
         guard st.movesInProgress.isEmpty else { return false }
-        return st.topology.shards.allSatisfy { $0.replicas.count >= options.replicationFactor }
+        // Ground truth for every listed replica: the controller lags behind restarts, so a
+        // freshly restarted (empty) process may still be listed as an active replica.
+        let live = sim.roles(StorageServer.self)
+        for shard in st.topology.shards {
+            guard shard.replicas.count >= options.replicationFactor else { return false }
+            for ep in shard.replicas {
+                guard let s = live.first(where: { $0.context.endpoint == ep }), s.tag != 0, s.isActive else { return false }
+            }
+        }
+        return true
     }
     func pick(_ xs: [Endpoint]) -> Endpoint? { xs.isEmpty ? nil : xs[Int(sim.random.below(UInt64(xs.count)))] }
     func killAndRestart(_ a: Endpoint) {

@@ -10,12 +10,42 @@ final class ClusterClient: Sendable {
     let transport: any ClientTransport
     let options: DatabaseOptions
     private let cached = Mutex<ClientInfo?>(nil)
+    /// The highest committed version this client has seen, and when (µs).
+    private let latestSeen = Mutex<(version: Version, at: UInt64)>((0, 0))
+
+    func observe(_ version: Version) {
+        let now = transport.now()
+        latestSeen.withLock { if version >= $0.version { $0 = (version, now) } }
+    }
+
+    /// Forget the remembered version (e.g. it predates a new generation).
+    func forgetRecentVersion() {
+        latestSeen.withLock { $0 = (0, 0) }
+    }
+
+    /// A recent committed version, if one was seen within `maxAge` µs.
+    func recentVersion(maxAge: UInt64) -> Version? {
+        let (v, at) = latestSeen.withLock { $0 }
+        guard v > 0, transport.now() &- at <= maxAge else { return nil }
+        return v
+    }
     private let controller = Mutex<Endpoint?>(nil)
 
     init(coordinators: [Endpoint], transport: any ClientTransport, options: DatabaseOptions) {
         self.coordinators = coordinators.map { $0.contains("#") ? $0 : $0 + "#coord" }
         self.transport = transport
         self.options = options
+        let me = WeakRef<ClusterClient>()
+        self.grvCoalescer = Coalescer<Int, Version>(maxBatch: .max) { items in
+            let r: Result<Version, any Error>
+            if let client = me.value {
+                do { r = .success(try await client.fetchReadVersion()) } catch { r = .failure(error) }
+            } else {
+                r = .failure(SwiftCacheError.unavailable("client closed"))
+            }
+            return Array(repeating: r, count: items.count)
+        }
+        me.value = self
     }
 
     // MARK: Discovery
@@ -64,7 +94,70 @@ final class ClusterClient: Sendable {
 
     // MARK: Proxies
 
+    /// Concurrent read-version requests in this process share one request to a proxy.
+    private let grvCoalescer: Coalescer<Int, Version>
+
+    /// Concurrent commits to the same proxy share one message (each is still resolved and
+    /// stamped individually by the proxy).
+    private let commitCoalescers = Mutex<[Endpoint: Coalescer<CommitRequest, CommitResult>]>([:])
+
+    private func commitCoalescer(_ endpoint: Endpoint) -> Coalescer<CommitRequest, CommitResult> {
+        commitCoalescers.withLock { all in
+            if let c = all[endpoint] { return c }
+            let transport = self.transport, timeout = self.options.requestTimeout
+            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512) { reqs in
+                do {
+                    let reply = try await transport.request(to: endpoint, timeout: timeout) { .commitBatch(rid: $0, reqs) }
+                    switch reply {
+                    case .commitBatchReply(_, let results) where results.count == reqs.count:
+                        return results.map { .success($0) }
+                    case .errorReply(_, let code):
+                        // The proxy no longer exists: none of these were taken.
+                        return Array(repeating: .success(.failed(code)), count: reqs.count)
+                    default:
+                        return Array(repeating: .failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")), count: reqs.count)
+                    }
+                } catch {
+                    return Array(repeating: .failure(error), count: reqs.count)
+                }
+            }
+            all[endpoint] = c
+            return c
+        }
+    }
+
+    /// Concurrent point reads to the same storage server share one message.
+    private let readCoalescers = Mutex<[Endpoint: Coalescer<ReadItem, ReadResult>]>([:])
+
+    private func readCoalescer(_ endpoint: Endpoint) -> Coalescer<ReadItem, ReadResult> {
+        readCoalescers.withLock { all in
+            if let c = all[endpoint] { return c }
+            let transport = self.transport, timeout = self.options.requestTimeout
+            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256) { items in
+                do {
+                    let reply = try await transport.request(to: endpoint, timeout: timeout) { .readBatch(rid: $0, items: items) }
+                    switch reply {
+                    case .readBatchReply(_, let results) where results.count == items.count:
+                        return results.map { .success($0) }
+                    case .errorReply(_, let code):
+                        return Array(repeating: .success(.error(code)), count: items.count)
+                    default:
+                        return Array(repeating: .failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")), count: items.count)
+                    }
+                } catch {
+                    return Array(repeating: .failure(error), count: items.count)
+                }
+            }
+            all[endpoint] = c
+            return c
+        }
+    }
+
     func readVersion() async throws -> Version {
+        try await grvCoalescer.submit(0)
+    }
+
+    private func fetchReadVersion() async throws -> Version {
         let p = try await proxy()
         let reply: Message
         do {
@@ -74,7 +167,9 @@ final class ClusterClient: Sendable {
             throw SwiftCacheError.unavailable("proxy \(p): \(error)")
         }
         switch reply {
-        case .readVersionReply(_, let v): return v
+        case .readVersionReply(_, let v):
+            observe(v)
+            return v
         case .errorReply(_, let code):
             invalidate()
             throw SwiftCacheError(code: code)
@@ -84,23 +179,23 @@ final class ClusterClient: Sendable {
 
     func commit(_ request: CommitRequest) async throws -> Versionstamp {
         let p = try await proxy()
-        let reply: Message
+        let result: CommitResult
         do {
-            reply = try await transport.request(to: p, timeout: options.requestTimeout) { .commit(rid: $0, request) }
+            result = try await commitCoalescer(p).submit(request)
+        } catch let e as SwiftCacheError {
+            throw e
         } catch {
+            // Sent, but no reply: it may or may not have committed.
             invalidate()
             throw SwiftCacheError.commitUnknownResult
         }
-        switch reply {
-        case .commitReply(_, .committed(let stamp)): return stamp
-        case .commitReply(_, .failed(let code)):
-            if code == .unavailable { invalidate() }
+        switch result {
+        case .committed(let stamp):
+            observe(stamp.version)
+            return stamp
+        case .failed(let code):
+            if code == .unavailable || code == .staleGeneration { invalidate() }
             throw SwiftCacheError(code: code)
-        case .errorReply(_, let code):
-            // The proxy no longer exists / ended before taking the request: not committed.
-            invalidate()
-            throw SwiftCacheError(code: code)
-        default: throw SwiftCacheError.internalError("unexpected reply \(reply.name)")
         }
     }
 
@@ -149,27 +244,25 @@ final class ClusterClient: Sendable {
             }
             var stale = false
             for replica in replicaOrder(shard.replicas) {
-                let reply: Message
+                let result: ReadResult
                 do {
-                    reply = try await transport.request(to: replica, timeout: options.requestTimeout) {
-                        .read(rid: $0, key: key, version: version)
-                    }
+                    result = try await readCoalescer(replica).submit(ReadItem(key: key, version: version))
+                } catch let e as SwiftCacheError {
+                    throw e
                 } catch {
                     lastError = .futureVersion
                     continue
                 }
-                switch reply {
-                case .readReply(_, let value, let stamp):
+                switch result {
+                case .value(let value, let stamp):
                     return (value, stamp)
-                case .errorReply(_, .wrongShard):
+                case .error(.wrongShard):
                     stale = true
                     lastError = .unavailable("stale topology")
-                case .errorReply(_, .futureVersion):
+                case .error(.futureVersion), .error(.staleGeneration):
                     lastError = .futureVersion
-                case .errorReply(_, let code):
+                case .error(let code):
                     throw SwiftCacheError(code: code)
-                default:
-                    throw SwiftCacheError.internalError("unexpected reply \(reply.name)")
                 }
                 if stale { break }
             }

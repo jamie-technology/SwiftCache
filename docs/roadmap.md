@@ -9,27 +9,15 @@
   (sequencer); commit proxies; resolver; replicated transaction logs that storage servers
   pull from; generation-based recovery with fencing; data distribution through metadata
   commits; exactly-once idempotent transactions; targeted fault scenarios.
+- **Milestone 3:** performance: request coalescing (read versions, reads, commits),
+  demand-driven storage peeks, a lighter read path, incremental resolver GC, a leaner
+  network layer; rollout-safe readiness probes.
 
-## Next: performance (vs Redis)
+## Performance
 
-Target: Redis-class single-key throughput and latency, measured side by side in the same
-k3s cluster (`redis-benchmark` against Redis 7 vs. an equivalent SwiftCache harness with
-matching key and value sizes and connection counts). Report GET/SET ops/s and
-p50/p99/p999, plus transactional workloads (bank transfers vs Redis `WATCH`/`MULTI`).
-
-Current laptop baseline (k3s on colima, 4 vCPU): ~7k ops/s at 80% reads, p50 4 ms, p99 12 ms.
-Every single-key operation is currently a full transaction. Likely work, roughly in order
-of payoff:
-
-- **Read versions:** batch GRV requests per proxy and confirm generation liveness once per
-  batch (FoundationDB does this); let clients reuse a recent read version for read-only
-  single-key gets (bounded staleness, opt-in) or use causal read-your-writes tokens.
-- **Commit path:** pipeline the master's committed-version acknowledgement instead of
-  waiting per batch; tune batching for latency versus throughput.
-- **Zero-copy encoding:** `ByteBuffer` end to end instead of `[UInt8]` copies.
-- **Storage:** multiple storage servers per process (one per core); a per-tag index in the
-  logs (peek currently scans entries).
-- **Clients:** connection pooling and request pipelining.
+Benchmarks against Redis, what was optimized, and what's next are in
+[performance.md](performance.md). Strictly serializable reads now match Redis at high
+concurrency in k3s. Replicated writes are about 2.7× behind.
 
 ## Known limitations
 

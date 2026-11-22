@@ -41,6 +41,11 @@ The new pods register, the controller forms a shard from them, and slots migrate
 multiple of `REPLICATION`) waits idle and replaces the next failed replica. Scaling *down*
 isn't supported yet.
 
+**Rolling restarts are safe.** A storage pod reports ready (`/ready` on the health port)
+only once its replica has re-copied its shard, so `kubectl rollout restart` never takes a
+shard's second replica down before the first has recovered. Without this, a rollout with
+replication 2 could restart both replicas of a shard back to back and lose it.
+
 More commit proxies (`PROXIES`) and logs (`LOGS`) take effect at the next recovery.
 Restarting one coordinator pod triggers one, or the cluster restores missing redundancy by
 itself.
@@ -93,6 +98,7 @@ sc bench --seconds 10 --concurrency 32 --read-ratio 0.8
 | `--mvcc-window` | 10 s | How far back historical reads and long transactions work |
 | `--failure-timeout` | 3 s | Missed registrations before a process counts as dead |
 | `--shard-loss-timeout` | 120 s | Silence tolerated from a shard's *last* replica before its data is given up |
+| `--health-port` | 8080 | HTTP probes: `/ready` (storage: caught-up member), `/live`; 0 disables |
 | `--log-level` | info | |
 
 Production timings are more conservative than the simulator's: leases 3 s, heartbeats every

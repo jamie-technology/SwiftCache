@@ -2,92 +2,150 @@ import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
+import Synchronization
 import SwiftCacheCore
 
-/// The production `ClientTransport`: one multiplexed TCP connection per server endpoint,
+/// The production `ClientTransport`: one multiplexed TCP connection per server process,
 /// requests matched to replies by request id.
+///
+/// Built for many concurrent tasks: each connection has its own lock and pending table
+/// (no global lock on the request path), writes from many tasks share one flush, and
+/// timeouts are enforced by a periodic sweep rather than a timer per request.
 public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
     let group: MultiThreadedEventLoopGroup
     let clientEndpoint: Endpoint
-    private let ownsGroup: Bool
-    // Guarded by `lock`.
-    private let lock = NIOLock()
-    private var connections: [Endpoint: EventLoopFuture<any Channel>] = [:]
-    private var pending: [UInt64: (endpoint: Endpoint, cont: CheckedContinuation<Message, any Error>)] = [:]
-    private var nextRid: UInt64 = 1
     private let startTime = NIODeadline.now()
+    private let nextRid = Atomic<UInt64>(1)
+    private let connectionsLock = NIOLock()
+    private var connections: [Endpoint: Connection] = [:]
+    private var sweeper: RepeatedTask?
+
+    /// One connection to one server process.
+    final class Connection: @unchecked Sendable {
+        let endpoint: Endpoint
+        let lock = NIOLock()
+        var channel: EventLoopFuture<any Channel>?
+        /// The established channel (fast path: no await on the future per request).
+        var ready: (any Channel)?
+        var pending: [UInt64: (deadline: UInt64, cont: CheckedContinuation<Message, any Error>)] = [:]
+        /// Only touched on the channel's event loop.
+        var flushScheduled = false
+        init(endpoint: Endpoint) { self.endpoint = endpoint }
+
+        func complete(_ rid: UInt64, _ result: Result<Message, any Error>) {
+            guard let entry = lock.withLock({ pending.removeValue(forKey: rid) }) else { return }
+            entry.cont.resume(with: result)
+        }
+
+        func failAll(_ error: any Error) {
+            let all = lock.withLock { () -> [CheckedContinuation<Message, any Error>] in
+                let c = pending.values.map(\.cont)
+                pending = [:]
+                channel = nil
+                ready = nil
+                return c
+            }
+            for c in all { c.resume(throwing: error) }
+        }
+    }
 
     public init(threads: Int = 1) {
         group = MultiThreadedEventLoopGroup(numberOfThreads: threads)
-        ownsGroup = true
         clientEndpoint = "client:\(UUID().uuidString.lowercased())"
+        sweeper = group.next().scheduleRepeatedTask(initialDelay: .milliseconds(20), delay: .milliseconds(20)) { [weak self] _ in
+            self?.sweepTimeouts()
+        }
     }
 
     deinit {
-        if ownsGroup { group.shutdownGracefully { _ in } }
+        sweeper?.cancel()
+        group.shutdownGracefully { _ in }
     }
 
     /// Closes all connections.
     public func close() {
-        let conns = lock.withLock { Array(connections.values) }
-        for c in conns { c.whenSuccess { $0.close(promise: nil) } }
+        let conns = connectionsLock.withLock { Array(connections.values) }
+        for c in conns { c.lock.withLock { c.channel }?.whenSuccess { $0.close(promise: nil) } }
     }
 
-    private func connection(to ep: Endpoint) -> EventLoopFuture<any Channel> {
-        lock.withLock {
-            if let f = connections[ep] { return f }
-            guard let (host, port) = parseEndpoint(ep) else {
-                return group.next().makeFailedFuture(TransportError.connectionFailed(ep, "bad endpoint"))
+    private func connection(for address: Endpoint) -> Connection {
+        connectionsLock.withLock {
+            if let c = connections[address] { return c }
+            let c = Connection(endpoint: address)
+            connections[address] = c
+            return c
+        }
+    }
+
+    private func channel(for conn: Connection) -> EventLoopFuture<any Channel> {
+        conn.lock.withLock {
+            if let f = conn.channel { return f }
+            guard let (host, port) = parseEndpoint(conn.endpoint) else {
+                return group.next().makeFailedFuture(TransportError.connectionFailed(conn.endpoint, "bad endpoint"))
             }
             let f = ClientBootstrap(group: group)
                 .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
                 .connectTimeout(.seconds(2))
-                .channelInitializer { [weak self] channel in
+                .channelInitializer { channel in
                     installFramePipeline(channel, onFrame: { _, frame in
                         guard let rid = frame.message.rid else { return }
-                        self?.complete(rid, .success(frame.message))
-                    }, onClose: { _ in self?.connectionClosed(ep) })
+                        conn.complete(rid, .success(frame.message))
+                    }, onClose: { _ in
+                        conn.failAll(TransportError.connectionFailed(conn.endpoint, "connection closed"))
+                    })
                 }
                 .connect(host: host, port: port)
-            f.whenFailure { [weak self] _ in self?.connectionClosed(ep) }
-            connections[ep] = f
+            f.whenFailure { error in conn.failAll(TransportError.connectionFailed(conn.endpoint, "\(error)")) }
+            f.whenSuccess { ch in conn.lock.withLock { if conn.channel === f { conn.ready = ch } } }
+            conn.channel = f
             return f
         }
     }
 
-    private func connectionClosed(_ ep: Endpoint) {
-        let failed: [CheckedContinuation<Message, any Error>] = lock.withLock {
-            connections[ep] = nil
-            let rids = pending.filter { $0.value.endpoint.processAddress == ep }.map(\.key)
-            return rids.compactMap { pending.removeValue(forKey: $0)?.cont }
+    private func sweepTimeouts() {
+        let now = self.now()
+        let conns = connectionsLock.withLock { Array(connections.values) }
+        for c in conns {
+            let expired = c.lock.withLock { () -> [CheckedContinuation<Message, any Error>] in
+                let rids = c.pending.filter { $0.value.deadline <= now }.map(\.key)
+                return rids.compactMap { c.pending.removeValue(forKey: $0)?.cont }
+            }
+            for cont in expired { cont.resume(throwing: TransportError.timedOut(c.endpoint)) }
         }
-        for c in failed { c.resume(throwing: TransportError.connectionFailed(ep, "connection closed")) }
-    }
-
-    private func complete(_ rid: UInt64, _ result: Result<Message, any Error>) {
-        guard let entry = lock.withLock({ pending.removeValue(forKey: rid) }) else { return }
-        entry.cont.resume(with: result)
     }
 
     public func request(to endpoint: Endpoint, timeout: UInt64, _ make: (UInt64) -> Message) async throws -> Message {
-        let rid = lock.withLock { () -> UInt64 in
-            defer { nextRid += 1 }
-            return nextRid
-        }
+        let rid = nextRid.add(1, ordering: .relaxed).oldValue
         let message = make(rid)
-        let channel: any Channel
-        do {
-            channel = try await connection(to: endpoint.processAddress).get()
-        } catch {
-            throw TransportError.connectionFailed(endpoint, "\(error)")
-        }
-        return try await withCheckedThrowingContinuation { cont in
-            lock.withLock { pending[rid] = (endpoint, cont) }
-            channel.writeAndFlush(encodeFrame(Frame(from: clientEndpoint, to: endpoint, message: message), allocator: channel.allocator)).whenFailure { [weak self] err in
-                self?.complete(rid, .failure(TransportError.connectionFailed(endpoint, "\(err)")))
+        let conn = connection(for: endpoint.processAddress)
+        let ch: any Channel
+        if let ready = conn.lock.withLock({ conn.ready }) {
+            ch = ready
+        } else {
+            do {
+                ch = try await channel(for: conn).get()
+            } catch {
+                throw TransportError.connectionFailed(endpoint, "\(error)")
             }
-            channel.eventLoop.scheduleTask(in: .microseconds(Int64(timeout))) { [weak self] in
-                self?.complete(rid, .failure(TransportError.timedOut(endpoint)))
+        }
+        let deadline = now() + timeout
+        let from = clientEndpoint
+        let frame = encodeFrame(Frame(from: from, to: endpoint, message: message), allocator: ch.allocator)
+        return try await withCheckedThrowingContinuation { cont in
+            conn.lock.withLock { conn.pending[rid] = (deadline, cont) }
+            // Write and flush bookkeeping both happen on the channel's loop, so a write is
+            // always followed by a flush, and writes from many tasks share one flush.
+            ch.eventLoop.execute {
+                ch.write(frame).whenFailure { err in
+                    conn.complete(rid, .failure(TransportError.connectionFailed(endpoint, "\(err)")))
+                }
+                if !conn.flushScheduled {
+                    conn.flushScheduled = true
+                    ch.eventLoop.execute {
+                        conn.flushScheduled = false
+                        ch.flush()
+                    }
+                }
             }
         }
     }

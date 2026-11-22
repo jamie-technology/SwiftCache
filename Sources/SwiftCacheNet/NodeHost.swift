@@ -28,6 +28,23 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
     private var outbound: [Endpoint: Outbound] = [:]
     private var clientChannels: [Endpoint: any Channel] = [:]
     private var downUntil: [Endpoint: NIODeadline] = [:]
+    /// Channels written to during this event-loop pass; flushed once at the end, so many
+    /// messages to one destination share a syscall and a packet.
+    private var dirty: [ObjectIdentifier: any Channel] = [:]
+    private var flushScheduled = false
+
+    private func write(_ buf: ByteBuffer, to ch: any Channel) {
+        ch.write(buf, promise: nil)
+        dirty[ObjectIdentifier(ch)] = ch
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        loop.execute { [self] in
+            self.flushScheduled = false
+            let chans = self.dirty
+            self.dirty = [:]
+            for ch in chans.values { ch.flush() }
+        }
+    }
 
     public init(address: Endpoint, dataDirectory: String?, logLevel: LogLevel = .info) throws {
         self.address = address
@@ -41,8 +58,25 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
         }
     }
 
-    /// Binds `host:port`, starts the process and blocks forever.
-    public func run(bindHost: String, port: Int, makeProcess: @escaping @Sendable (any ProcessEnvironment) -> any ProcessNode) throws -> Never {
+    /// Binds `host:port`, starts the process and blocks forever. If `healthPort` is set,
+    /// serves `GET /ready` (200 when `isReady` is true, 503 otherwise) and `GET /live`.
+    public func run(bindHost: String, port: Int, healthPort: Int? = nil, isReady: (@Sendable () -> Bool)? = nil,
+                    makeProcess: @escaping @Sendable (any ProcessEnvironment) -> any ProcessNode) throws -> Never {
+        if let healthPort {
+            let loop = self.loop
+            _ = try ServerBootstrap(group: group)
+                .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .childChannelInitializer { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations.addHandler(HealthHandler(check: {
+                            // Role state lives on the process loop (the health server shares it).
+                            loop.preconditionInEventLoop()
+                            return isReady?() ?? true
+                        }))
+                    }
+                }
+                .bind(host: bindHost, port: healthPort).wait()
+        }
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -88,7 +122,7 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
         loop.preconditionInEventLoop()
         let buf = encodeFrame(Frame(from: from, to: to, message: message), allocator: ByteBufferAllocator())
         if to.hasPrefix("client:") {
-            clientChannels[to.processAddress]?.writeAndFlush(buf, promise: nil)
+            if let ch = clientChannels[to.processAddress] { write(buf, to: ch) }
             return
         }
         let dest = to.processAddress
@@ -99,7 +133,7 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
         }
         switch outbound[dest] {
         case .ready(let ch)?:
-            ch.writeAndFlush(buf, promise: nil)
+            write(buf, to: ch)
         case .connecting(var queue)?:
             queue.append(buf)
             outbound[dest] = .connecting(queue)
@@ -209,4 +243,28 @@ public final class MemoryDisk: Disk {
     public init() {}
     public func read(_ key: String) -> Bytes? { values[key] }
     public func write(_ key: String, _ value: Bytes) { values[key] = value }
+}
+
+/// A minimal HTTP responder for Kubernetes probes: `/ready` reflects `check`, anything
+/// else answers 200 (liveness).
+final class HealthHandler: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+    let check: () -> Bool
+    private var request = ""
+
+    init(check: @escaping () -> Bool) { self.check = check }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buf = unwrapInboundIn(data)
+        request += buf.readString(length: buf.readableBytes) ?? ""
+        guard request.contains("\r\n\r\n") || request.contains("\n\n") else { return }
+        let ok = request.hasPrefix("GET /ready") ? check() : true
+        let body = ok ? "ok\n" : "not ready\n"
+        let head = "HTTP/1.1 \(ok ? "200 OK" : "503 Service Unavailable")\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+        var out = context.channel.allocator.buffer(capacity: 128)
+        out.writeString(head + body)
+        let channel = context.channel
+        context.writeAndFlush(wrapOutboundOut(out)).whenComplete { _ in channel.close(promise: nil) }
+    }
 }

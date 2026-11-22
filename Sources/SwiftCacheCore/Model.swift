@@ -396,3 +396,31 @@ public struct ClusterStatus: Hashable, Sendable, WireCodable {
         movesInProgress = try r.strings(); recoveries = try r.u64()
     }
 }
+
+public struct ReadItem: Hashable, Sendable, WireCodable {
+    public var key: Bytes
+    public var version: Version
+    public init(key: Bytes, version: Version) { self.key = key; self.version = version }
+    public func encode(to w: inout WireWriter) { w.blob(key); w.u64(version) }
+    public init(from r: inout WireReader) throws { key = try r.blob(); version = try r.u64() }
+}
+
+/// The result of one read in a batch: a value (or absence) with its versionstamp, or an error.
+public enum ReadResult: Hashable, Sendable, WireCodable {
+    case value(Bytes?, Versionstamp)
+    case error(ErrorCode)
+
+    public func encode(to w: inout WireWriter) {
+        switch self {
+        case .value(let v, let s): w.u8(1); w.optionalBlob(v); w.stamp(s)
+        case .error(let e): w.u8(2); w.u16(e.rawValue)
+        }
+    }
+    public init(from r: inout WireReader) throws {
+        switch try r.u8() {
+        case 1: self = .value(try r.optionalBlob(), try r.stamp())
+        case 2: self = .error(ErrorCode(rawValue: try r.u16()) ?? .internalError)
+        case let t: throw WireError("bad read result \(t)")
+        }
+    }
+}

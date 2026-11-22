@@ -30,6 +30,31 @@ public final class CommitProxy: Role {
         var client: Endpoint
         var rid: UInt64
         var request: CommitRequest
+        /// Set when the commit arrived in a `commitBatch`: the reply is collective.
+        var group: CommitGroup? = nil
+        var index = 0
+    }
+
+    /// The commits of one `commitBatch`, answered together once all are decided.
+    final class CommitGroup {
+        let client: Endpoint
+        let rid: UInt64
+        var results: [CommitResult?]
+        var remaining: Int
+        init(client: Endpoint, rid: UInt64, count: Int) {
+            self.client = client; self.rid = rid
+            results = Array(repeating: nil, count: count); remaining = count
+        }
+    }
+
+    private func reply(_ p: Pending, _ result: CommitResult) {
+        guard let g = p.group else {
+            context.send(.commitReply(rid: p.rid, result), to: p.client)
+            return
+        }
+        if g.results[p.index] == nil { g.remaining -= 1 }
+        g.results[p.index] = result
+        if g.remaining == 0 { context.send(.commitBatchReply(rid: g.rid, g.results.map { $0! }), to: g.client) }
     }
     private var pending: [Pending] = []
     private var metaPending: [Pending] = []
@@ -44,7 +69,7 @@ public final class CommitProxy: Role {
         var finalized = false
         var acks: Set<Endpoint> = []
         var durable = false
-        var replies: [(client: Endpoint, rid: UInt64, result: CommitResult)] = []
+        var replies: [(pending: Pending, result: CommitResult)] = []
         var hasData = false
         init(num: UInt64, txns: [Pending], meta: [Pending]) { self.num = num; self.txns = txns; self.meta = meta }
     }
@@ -55,7 +80,9 @@ public final class CommitProxy: Role {
     private var snapshotWritten = false
 
     private var grvQueue: [(client: Endpoint, rid: UInt64)] = []
-    private var grvInFlight = false
+    /// Read-version rounds in flight (each confirms liveness independently).
+    private var grvRounds = 0
+    private let maxGRVRounds = 1
     private var mapWaiters: [(client: Endpoint, rid: UInt64, minVersion: Version)] = []
 
     init(context: RoleContext, config: ClusterConfig, spec: ProxySpec) {
@@ -87,7 +114,7 @@ public final class CommitProxy: Role {
             && (!pending.isEmpty || !metaPending.isEmpty || idle || committedAdvanced || needSnapshot) {
             startBatch()
         }
-        if !grvQueue.isEmpty && !grvInFlight { startGRV() }
+        if !grvQueue.isEmpty && grvRounds < maxGRVRounds { startGRV() }
     }
 
     // MARK: Requests
@@ -100,16 +127,16 @@ public final class CommitProxy: Role {
         switch message {
         case .getReadVersion(let rid):
             grvQueue.append((from, rid))
+            if grvRounds < maxGRVRounds { startGRV() }
         case .commit(let rid, let req):
-            if let error = validate(req, from: from) {
-                context.send(.commitReply(rid: rid, .failed(error)), to: from)
-                return
+            enqueue(Pending(client: from, rid: rid, request: req))
+        case .commitBatch(let rid, let reqs):
+            let group = CommitGroup(client: from, rid: rid, count: reqs.count)
+            for (i, req) in reqs.enumerated() {
+                enqueue(Pending(client: from, rid: rid, request: req, group: group, index: i), startIfIdle: false)
             }
-            if req.metaOps.isEmpty {
-                pending.append(Pending(client: from, rid: rid, request: req))
-            } else {
-                metaPending.append(Pending(client: from, rid: rid, request: req))
-            }
+            if batches.isEmpty && !pending.isEmpty { startBatch() }
+            if reqs.isEmpty { context.send(.commitBatchReply(rid: rid, []), to: from) }
         case .getShardMap(let rid, let minVersion):
             if map.version >= minVersion || lastResolvedVersion >= minVersion {
                 context.send(.shardMapReply(rid: rid, map), to: from)
@@ -119,6 +146,16 @@ public final class CommitProxy: Role {
         default:
             if let rid = message.rid, !message.isReply { context.send(.errorReply(rid: rid, .invalidRequest), to: from) }
         }
+    }
+
+    private func enqueue(_ p: Pending, startIfIdle: Bool = true) {
+        if let error = validate(p.request, from: p.client) {
+            reply(p, .failed(error))
+            return
+        }
+        if p.request.metaOps.isEmpty { pending.append(p) } else { metaPending.append(p) }
+        // Lightly loaded: don't wait for the batching tick.
+        if startIfIdle && batches.isEmpty { startBatch() }
     }
 
     private func validate(_ req: CommitRequest, from: Endpoint) -> ErrorCode? {
@@ -239,7 +276,7 @@ public final class CommitProxy: Role {
             case 0:
                 let routed = p.request.mutations.map { ($0, map.tags(forSlot: Slots.slot(for: $0.key))) }
                 if routed.contains(where: { $0.1.isEmpty }) {
-                    b.replies.append((p.client, p.rid, .failed(.unavailable)))
+                    b.replies.append((p, .failed(.unavailable)))
                     continue
                 }
                 let stamp = Versionstamp(version: b.version, order: order)
@@ -251,12 +288,12 @@ public final class CommitProxy: Role {
                     let tags = map.tags(forSlot: Slots.slot(for: key))
                     if !tags.isEmpty { messages.append(LogMessage(order: order, mutation: m, tags: tags)) }
                 }
-                b.replies.append((p.client, p.rid, .committed(stamp)))
+                b.replies.append((p, .committed(stamp)))
                 order += 1
             case 2:
-                b.replies.append((p.client, p.rid, .failed(.transactionTooOld)))
+                b.replies.append((p, .failed(.transactionTooOld)))
             default:
-                b.replies.append((p.client, p.rid, .failed(.notCommitted)))
+                b.replies.append((p, .failed(.notCommitted)))
             }
         }
         var meta: [TaggedMeta] = []
@@ -265,7 +302,7 @@ public final class CommitProxy: Role {
                 meta.append(TaggedMeta(op: op, tags: map.tagsAffected(by: op) + [metadataTag]))
                 map.apply(op, at: b.version)
             }
-            b.replies.append((p.client, p.rid, .committed(Versionstamp(version: b.version, order: order))))
+            b.replies.append((p, .committed(Versionstamp(version: b.version, order: order))))
             order += 1
         }
         if spec.writeSnapshot && !snapshotWritten {
@@ -316,14 +353,22 @@ public final class CommitProxy: Role {
         reportCommitted(last.version) { [weak self] in
             guard let self, !self.dead else { return }
             self.reporting = false
-            self.knownCommitted = max(self.knownCommitted, last.version)
+            self.advanceKnownCommitted(last.version)
             for b in ready {
-                for r in b.replies { self.context.send(.commitReply(rid: r.rid, r.result), to: r.client) }
+                for r in b.replies { self.reply(r.pending, r.result) }
                 if b.hasData { self.committedAdvanced = true }
             }
             self.batches.removeFirst(ready.count)
             self.completeDurable()
         }
+    }
+
+    /// Everything up to `version` is on every log: tell the logs right away so storage
+    /// servers can serve it without waiting for the next push.
+    private func advanceKnownCommitted(_ version: Version) {
+        guard version > knownCommitted else { return }
+        knownCommitted = version
+        for t in spec.tlogs { context.send(.tlogCommitted(generation: spec.generation, version: version), to: t) }
     }
 
     private func reportCommitted(_ version: Version, then: @escaping () -> Void) {
@@ -347,7 +392,7 @@ public final class CommitProxy: Role {
     // MARK: Read versions
 
     private func startGRV() {
-        grvInFlight = true
+        grvRounds += 1
         let waiting = grvQueue
         grvQueue = []
         var masterVersion: Version?
@@ -359,16 +404,18 @@ public final class CommitProxy: Role {
             guard !finished, !dead else { return }
             if failed {
                 finished = true
-                grvInFlight = false
+                grvRounds -= 1
                 for w in waiting { context.send(.errorReply(rid: w.rid, .unavailable), to: w.client) }
                 return
             }
             guard let mv = masterVersion, confirmed == needed else { return }
             finished = true
-            grvInFlight = false
+            grvRounds -= 1
             let v = max(mv, knownCommitted)
-            knownCommitted = v
+            advanceKnownCommitted(v)
             for w in waiting { context.send(.readVersionReply(rid: w.rid, version: v), to: w.client) }
+            // Requests that arrived during this round get the next one right away.
+            if !grvQueue.isEmpty && grvRounds < maxGRVRounds { startGRV() }
         }
         context.request(to: spec.master, timeout: config.requestTimeout, { .getLiveCommitted(rid: $0) }) { [weak self] reply in
             guard self != nil else { return }

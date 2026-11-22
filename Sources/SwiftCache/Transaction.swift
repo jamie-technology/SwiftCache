@@ -278,7 +278,19 @@ public final class Transaction: Sendable {
             state.withLock { $0.committed = true }
             return nil
         }
-        let readVersion = try await self.readVersion()
+        // A transaction that read nothing has no read conflicts to check: its read version
+        // only bounds the window in which *its own* idempotency key is checked, where an
+        // older version is merely more conservative. So reuse a recent version instead of
+        // a round trip (a write-only transaction is ordered by its commit version).
+        let readVersion: Version
+        if let v = state.withLock({ $0.readVersion }) {
+            readVersion = v
+        } else if s.readConflictKeys.isEmpty, s.readConflictRanges.isEmpty,
+                  let recent = client.recentVersion(maxAge: 1_000_000) {
+            readVersion = recent
+        } else {
+            readVersion = try await self.readVersion()
+        }
         let request = CommitRequest(
             readVersion: readVersion,
             readConflictKeys: s.readConflictKeys.sorted(by: bytesLess),

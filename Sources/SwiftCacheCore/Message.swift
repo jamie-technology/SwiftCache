@@ -6,6 +6,9 @@ public enum Message: Hashable, Sendable {
     case readVersionReply(rid: UInt64, version: Version)
     case commit(rid: UInt64, CommitRequest)
     case commitReply(rid: UInt64, CommitResult)
+    /// Many independent commits in one message (each resolved and stamped individually).
+    case commitBatch(rid: UInt64, [CommitRequest])
+    case commitBatchReply(rid: UInt64, [CommitResult])
     case getClientInfo(rid: UInt64)
     case clientInfoReply(rid: UInt64, ClientInfo)
     case getStatus(rid: UInt64)
@@ -17,6 +20,9 @@ public enum Message: Hashable, Sendable {
     case readReply(rid: UInt64, value: Bytes?, stamp: Versionstamp)
     case readRange(rid: UInt64, range: KeyRange, version: Version, limit: UInt32)
     case rangeReply(rid: UInt64, entries: [KeyValueEntry], more: Bool, servedSlots: SlotSet)
+    /// Many point reads in one message (each at its own version).
+    case readBatch(rid: UInt64, items: [ReadItem])
+    case readBatchReply(rid: UInt64, results: [ReadResult])
     case getStorageStats(rid: UInt64)
     case storageStatsReply(rid: UInt64, StorageStats)
     case fetchSnapshot(rid: UInt64, slots: SlotSet, minVersion: Version)
@@ -61,8 +67,10 @@ public enum Message: Hashable, Sendable {
     // MARK: Transaction logs
     case tlogPush(rid: UInt64, TLogPush)
     case tlogPushReply(rid: UInt64, ok: Bool)
-    /// `upTo` = 0 means "up to what is known committed".
-    case tlogPeek(rid: UInt64, tag: Tag, from: Version, upTo: Version)
+    /// `upTo` = 0 means "up to what is known committed". The log holds the request until
+    /// the tag has new committed data, or the committed version reaches `need` (when
+    /// non-zero: a read is waiting for it), or the long-poll times out.
+    case tlogPeek(rid: UInt64, tag: Tag, from: Version, upTo: Version, need: Version)
     case tlogPeekReply(rid: UInt64, PeekReply)
     case tlogPop(tag: Tag, version: Version)
     case tlogLock(rid: UInt64, generation: UInt64)
@@ -70,15 +78,18 @@ public enum Message: Hashable, Sendable {
     case tlogConfirm(rid: UInt64, generation: UInt64)
     case tlogConfirmReply(rid: UInt64, ok: Bool)
     case tlogFetch(rid: UInt64, upTo: Version)
+    /// Proxy -> logs: everything up to `version` is on every log (lets storage read it now
+    /// instead of waiting for the next push to carry the news).
+    case tlogCommitted(generation: UInt64, version: Version)
     case tlogFetchReply(rid: UInt64, FetchReply)
 
     /// The request id if this is a request or reply.
     public var rid: UInt64? {
         switch self {
-        case .getReadVersion(let r), .readVersionReply(let r, _), .commit(let r, _), .commitReply(let r, _),
+        case .getReadVersion(let r), .readVersionReply(let r, _), .commit(let r, _), .commitReply(let r, _), .commitBatch(let r, _), .commitBatchReply(let r, _),
              .getClientInfo(let r), .clientInfoReply(let r, _), .getStatus(let r), .statusReply(let r, _),
              .errorReply(let r, _), .read(let r, _, _), .readReply(let r, _, _), .readRange(let r, _, _, _),
-             .rangeReply(let r, _, _, _), .getStorageStats(let r), .storageStatsReply(let r, _),
+             .rangeReply(let r, _, _, _), .getStorageStats(let r), .readBatch(let r, _), .readBatchReply(let r, _), .storageStatsReply(let r, _),
              .fetchSnapshot(let r, _, _), .snapshotChunk(let r, _),
              .candidacy(let r, _), .nominationReply(let r, _), .leaderHeartbeat(let r, _), .heartbeatReply(let r, _),
              .getLeader(let r), .leaderReply(let r, _), .genRead(let r, _), .genReadReply(let r, _, _, _, _),
@@ -87,11 +98,11 @@ public enum Message: Hashable, Sendable {
              .recoveryComplete(let r, _), .ack(let r), .getShardMap(let r, _), .shardMapReply(let r, _),
              .getCommitVersion(let r, _, _), .commitVersionReply(let r, _, _), .getLiveCommitted(let r), .reportCommitted(let r, _),
              .liveCommittedReply(let r, _), .resolve(let r, _), .resolveReply(let r, _),
-             .tlogPush(let r, _), .tlogPushReply(let r, _), .tlogPeek(let r, _, _, _), .tlogPeekReply(let r, _),
+             .tlogPush(let r, _), .tlogPushReply(let r, _), .tlogPeek(let r, _, _, _, _), .tlogPeekReply(let r, _),
              .tlogLock(let r, _), .tlogLockReply(let r, _), .tlogConfirm(let r, _), .tlogConfirmReply(let r, _),
              .tlogFetch(let r, _), .tlogFetchReply(let r, _):
             return r
-        case .moveReady, .serverDBInfo, .halt, .tlogPop:
+        case .moveReady, .serverDBInfo, .halt, .tlogPop, .tlogCommitted:
             return nil
         }
     }
@@ -99,7 +110,7 @@ public enum Message: Hashable, Sendable {
     /// Whether this message is a reply (routed back to whoever is waiting on `rid`).
     public var isReply: Bool {
         switch self {
-        case .readVersionReply, .commitReply, .clientInfoReply, .statusReply, .errorReply, .readReply, .rangeReply,
+        case .readVersionReply, .commitReply, .readBatchReply, .commitBatchReply, .clientInfoReply, .statusReply, .errorReply, .readReply, .rangeReply,
              .storageStatsReply, .snapshotChunk, .nominationReply, .heartbeatReply, .leaderReply, .genReadReply,
              .genWriteReply, .registerReply, .recruitReply, .ack, .shardMapReply, .commitVersionReply,
              .liveCommittedReply, .resolveReply, .tlogPushReply, .tlogPeekReply, .tlogLockReply, .tlogConfirmReply,
@@ -147,6 +158,10 @@ extension Message {
         case .fetchSnapshot(let rid, let slots, let v): w.u8(16); w.u64(rid); w.slots(slots); w.u64(v)
         case .snapshotChunk(let rid, let c): w.u8(17); w.u64(rid); w.put(c)
         case .moveReady(let id, let tag): w.u8(18); w.u64(id); w.u32(tag)
+        case .readBatch(let rid, let items): w.u8(19); w.u64(rid); w.put(items)
+        case .readBatchReply(let rid, let results): w.u8(62); w.u64(rid); w.put(results)
+        case .commitBatch(let rid, let reqs): w.u8(63); w.u64(rid); w.put(reqs)
+        case .commitBatchReply(let rid, let results): w.u8(64); w.u64(rid); w.put(results)
 
         case .candidacy(let rid, let l): w.u8(20); w.u64(rid); w.put(l)
         case .nominationReply(let rid, let l): w.u8(21); w.u64(rid); w.put(l)
@@ -180,7 +195,7 @@ extension Message {
 
         case .tlogPush(let rid, let p): w.u8(50); w.u64(rid); w.put(p)
         case .tlogPushReply(let rid, let ok): w.u8(51); w.u64(rid); w.bool(ok)
-        case .tlogPeek(let rid, let tag, let from, let upTo): w.u8(52); w.u64(rid); w.u32(tag); w.u64(from); w.u64(upTo)
+        case .tlogPeek(let rid, let tag, let from, let upTo, let need): w.u8(52); w.u64(rid); w.u32(tag); w.u64(from); w.u64(upTo); w.u64(need)
         case .tlogPeekReply(let rid, let p): w.u8(53); w.u64(rid); w.put(p)
         case .tlogPop(let tag, let v): w.u8(54); w.u32(tag); w.u64(v)
         case .tlogLock(let rid, let g): w.u8(55); w.u64(rid); w.u64(g)
@@ -189,6 +204,7 @@ extension Message {
         case .tlogConfirmReply(let rid, let ok): w.u8(58); w.u64(rid); w.bool(ok)
         case .tlogFetch(let rid, let v): w.u8(59); w.u64(rid); w.u64(v)
         case .tlogFetchReply(let rid, let f): w.u8(60); w.u64(rid); w.put(f)
+        case .tlogCommitted(let g, let v): w.u8(61); w.u64(g); w.u64(v)
         }
     }
 
@@ -221,6 +237,10 @@ extension Message {
         case 16: return .fetchSnapshot(rid: try r.u64(), slots: try r.slots(), minVersion: try r.u64())
         case 17: return .snapshotChunk(rid: try r.u64(), try r.get())
         case 18: return .moveReady(moveID: try r.u64(), tag: try r.u32())
+        case 19: return .readBatch(rid: try r.u64(), items: try r.getArray())
+        case 62: return .readBatchReply(rid: try r.u64(), results: try r.getArray())
+        case 63: return .commitBatch(rid: try r.u64(), try r.getArray())
+        case 64: return .commitBatchReply(rid: try r.u64(), try r.getArray())
 
         case 20: return .candidacy(rid: try r.u64(), try r.get())
         case 21: return .nominationReply(rid: try r.u64(), try r.getOptional())
@@ -254,7 +274,7 @@ extension Message {
 
         case 50: return .tlogPush(rid: try r.u64(), try r.get())
         case 51: return .tlogPushReply(rid: try r.u64(), ok: try r.bool())
-        case 52: return .tlogPeek(rid: try r.u64(), tag: try r.u32(), from: try r.u64(), upTo: try r.u64())
+        case 52: return .tlogPeek(rid: try r.u64(), tag: try r.u32(), from: try r.u64(), upTo: try r.u64(), need: try r.u64())
         case 53: return .tlogPeekReply(rid: try r.u64(), try r.get())
         case 54: return .tlogPop(tag: try r.u32(), version: try r.u64())
         case 55: return .tlogLock(rid: try r.u64(), generation: try r.u64())
@@ -263,6 +283,7 @@ extension Message {
         case 58: return .tlogConfirmReply(rid: try r.u64(), ok: try r.bool())
         case 59: return .tlogFetch(rid: try r.u64(), upTo: try r.u64())
         case 60: return .tlogFetchReply(rid: try r.u64(), try r.get())
+        case 61: return .tlogCommitted(generation: try r.u64(), version: try r.u64())
         default:
             throw WireError("unknown message tag \(tag)")
         }

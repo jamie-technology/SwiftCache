@@ -24,9 +24,15 @@ public final class StorageServer: Role {
 
     private var dbInfo = ServerDBInfo.empty
     private var peekInFlight = false
+    /// Identifies the current peek; replies to superseded peeks don't drive the loop.
+    private var peekSeq: UInt64 = 0
+    /// The version the current peek asks the log to wait for (0 = data only).
+    private var peekNeed: Version = 0
     private var peekCursor = 0
     private var lastPopped: Version = 0
     private var tagRetired = Set<Tag>()
+    /// When this server last stopped being (or started out not being) a shard member.
+    private var idleSince: UInt64 = 0
 
     struct Receive {
         var moveID: UInt64
@@ -62,7 +68,16 @@ public final class StorageServer: Role {
         self.config = config
     }
 
+    /// Safe to take another replica down (rolling restarts wait for this): an active,
+    /// caught-up shard member, or a spare that has been idle long enough that the cluster
+    /// clearly doesn't need it.
+    public var isReadyForRollout: Bool {
+        if tag != 0 { return isActive && receives.values.allSatisfy { !$0.isCatchUp } }
+        return context.now &- idleSince > 30_000_000
+    }
+
     public func start() {
+        idleSince = context.now
         context.every(config.popInterval) { [weak self] in self?.housekeeping() }
     }
 
@@ -97,7 +112,7 @@ public final class StorageServer: Role {
     func updateDBInfo(_ info: ServerDBInfo) {
         let changed = info.tlogs != dbInfo.tlogs
         dbInfo = info
-        if changed { peekCursor = 0 }
+        if changed { peekCursor = Int(tag) }
         pullIfNeeded()
     }
 
@@ -105,6 +120,7 @@ public final class StorageServer: Role {
     func assignTag(_ assigned: Tag) {
         guard assigned != 0, tag == 0, !tagRetired.contains(assigned) else { return }
         tag = assigned
+        peekCursor = Int(assigned)  // spread storage servers across the logs
         applied = 0
         context.log(.info, "assigned tag \(assigned)")
         pullIfNeeded()
@@ -114,6 +130,7 @@ public final class StorageServer: Role {
         context.log(.warning, "wiping (\(reason)); waiting for a new assignment")
         if tag != 0 { tagRetired.insert(tag) }
         tag = 0
+        idleSince = context.now
         shardID = -1
         isActive = false
         applied = 0
@@ -129,16 +146,38 @@ public final class StorageServer: Role {
 
     // MARK: Pulling from the logs
 
+    /// The highest version a waiting read (or snapshot) needs.
+    private var neededVersion: Version {
+        waiters.map(\.version).max() ?? 0
+    }
+
+    /// A read needs `version` before our tag's next data may arrive: ask the log to answer
+    /// as soon as it's committed (superseding a data-only peek).
+    private func needVersion(_ version: Version) {
+        guard version > applied, version > peekNeed || !peekInFlight else { return }
+        peekInFlight = false
+        pullIfNeeded()
+    }
+
     private func pullIfNeeded() {
         guard tag != 0, !peekInFlight, !dbInfo.tlogs.isEmpty else { return }
         peekInFlight = true
+        peekSeq += 1
+        let seq = peekSeq
         let tlog = dbInfo.tlogs[peekCursor % dbInfo.tlogs.count]
         let myTag = tag
         let after = applied
+        let need = neededVersion > applied ? neededVersion : 0
+        peekNeed = need
         context.request(to: tlog, timeout: config.peekTimeout + config.requestTimeout, {
-            .tlogPeek(rid: $0, tag: myTag, from: after, upTo: 0)
+            .tlogPeek(rid: $0, tag: myTag, from: after, upTo: 0, need: need)
         }) { [weak self] reply in
             guard let self else { return }
+            guard seq == self.peekSeq else {
+                // Superseded by a peek with a higher need: keep any data, don't re-loop.
+                if case .tlogPeekReply(_, let p)? = reply, p.status == .ok, self.tag == myTag { self.applyPeek(p) }
+                return
+            }
             self.peekInFlight = false
             guard self.tag == myTag else { return self.pullIfNeeded() }
             switch reply {
@@ -361,6 +400,8 @@ public final class StorageServer: Role {
         switch message {
         case .read(let rid, let key, let version):
             handleRead(rid: rid, key: key, version: version, from: from)
+        case .readBatch(let rid, let items):
+            handleReadBatch(rid: rid, items: items, from: from)
         case .readRange(let rid, let range, let version, let limit):
             handleRange(rid: rid, range: range, version: version, limit: Int(limit), from: from)
         case .fetchSnapshot(let rid, let slots, let minVersion):
@@ -380,6 +421,7 @@ public final class StorageServer: Role {
         let id = nextWaiterID
         nextWaiterID += 1
         waiters.append(Waiter(id: id, version: version, run: run, expire: expire))
+        needVersion(version)
         context.schedule(after: config.readWaitTimeout) { [weak self] in
             guard let self, let idx = self.waiters.firstIndex(where: { $0.id == id }) else { return }
             let w = self.waiters.remove(at: idx)
@@ -427,6 +469,36 @@ public final class StorageServer: Role {
         } else {
             context.send(.readReply(rid: rid, value: nil, stamp: .zero), to: from)
         }
+    }
+
+    /// Answers many reads at once: waits (once) for the highest version among them, then
+    /// evaluates each exactly like a single read.
+    private func handleReadBatch(rid: UInt64, items: [ReadItem], from: Endpoint) {
+        let maxVersion = items.map(\.version).max() ?? 0
+        if tag != 0, shardID >= 0, maxVersion > applied {
+            wait(for: maxVersion, then: { [weak self] in
+                self?.handleReadBatch(rid: rid, items: items, from: from)
+            }, expire: { [weak self] in
+                // Serve what we can; the rest fail with future_version (retried by clients).
+                self?.answerReadBatch(rid: rid, items: items, from: from)
+            })
+            return
+        }
+        answerReadBatch(rid: rid, items: items, from: from)
+    }
+
+    private func answerReadBatch(rid: UInt64, items: [ReadItem], from: Endpoint) {
+        let results = items.map { item -> ReadResult in
+            if tag == 0 || shardID < 0 { return .error(.wrongShard) }
+            if item.version < oldestReadable { return .error(.transactionTooOld) }
+            if item.version > applied { return .error(.futureVersion) }
+            guard owned.contains(Slots.slot(for: item.key)) else { return .error(.wrongShard) }
+            if let v = store.get(item.key, at: item.version), let value = v.visibleValue(at: item.version) {
+                return .value(value, v.stamp)
+            }
+            return .value(nil, .zero)
+        }
+        context.send(.readBatchReply(rid: rid, results: results), to: from)
     }
 
     private func handleRange(rid: UInt64, range: KeyRange, version: Version, limit: Int, from: Endpoint) {

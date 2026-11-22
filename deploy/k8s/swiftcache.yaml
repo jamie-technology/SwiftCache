@@ -93,8 +93,12 @@ spec:
           ports:
             - {containerPort: 4500, name: swiftcache}
           readinessProbe:
-            tcpSocket: {port: 4500}
+            httpGet: {path: /ready, port: 8080}
             periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /live, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 6
           volumeMounts:
             - {name: data, mountPath: /data}
           resources:
@@ -148,8 +152,12 @@ spec:
           ports:
             - {containerPort: 4500, name: swiftcache}
           readinessProbe:
-            tcpSocket: {port: 4500}
+            httpGet: {path: /ready, port: 8080}
             periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /live, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 6
           resources:
             requests: {cpu: 100m, memory: 64Mi}
             limits: {memory: 1Gi}
@@ -173,6 +181,8 @@ spec:
       topologySpreadConstraints:
         - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway,
            labelSelector: {matchLabels: {app.kubernetes.io/component: storage}}}
+      # Rolling updates wait for /ready, which a storage pod reports only once its replica
+      # has re-copied its shard's data: one shard never loses two replicas to a rollout.
       containers:
         - name: swiftcache
           image: swiftcache:latest
@@ -194,8 +204,12 @@ spec:
           ports:
             - {containerPort: 4500, name: swiftcache}
           readinessProbe:
-            tcpSocket: {port: 4500}
+            httpGet: {path: /ready, port: 8080}
             periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /live, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 6
           resources:
             requests: {cpu: 100m, memory: 128Mi}
             limits:

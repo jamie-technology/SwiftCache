@@ -90,6 +90,7 @@ public final class Database: Sendable {
                     throw SwiftCacheError.commitUnknownResult
                 }
             } catch let error as SwiftCacheError {
+                if error == .transactionTooOld { client.forgetRecentVersion() }
                 let retryable = error.isRetryable && !(pinnedVersion != nil && error == .transactionTooOld)
                 guard retryable else { throw error }
                 tries += 1
@@ -113,16 +114,36 @@ public final class Database: Sendable {
     // MARK: Single-key conveniences (each is its own, idempotent, transaction)
 
     public func get(_ key: some CacheKey) async throws -> Bytes? {
-        try await transaction { try await $0.get(key) }
+        try await getVersioned(key)?.bytes
     }
 
     public func get<T: Decodable>(_ key: some CacheKey, as type: T.Type) async throws -> T? {
-        try await transaction { try await $0.get(key, as: type) }
+        guard let bytes = try await get(key) else { return nil }
+        return try ValueCodec.decode(type, from: bytes)
     }
 
     /// Reads a key and the versionstamp of the commit that last wrote it.
+    ///
+    /// A single strictly serializable read: a fresh read version (so it sees every commit
+    /// acknowledged before the call) and one storage read, retried like a transaction —
+    /// without building a transaction.
     public func getVersioned(_ key: some CacheKey) async throws -> VersionedEntry? {
-        try await transaction { try await $0.getVersioned(key) }
+        let k = key.cacheKeyBytes
+        var tries = 0
+        var backoff = options.initialBackoff
+        while true {
+            do {
+                let version = try await client.readVersion()
+                let (value, stamp) = try await client.read(k, at: version)
+                return value.map { VersionedEntry(key: k, bytes: $0, versionstamp: stamp) }
+            } catch let error as SwiftCacheError where error.isRetryable {
+                tries += 1
+                if tries >= options.maxRetries { throw SwiftCacheError.retryLimitExceeded(last: error.description) }
+                let jitter = client.transport.random(backoff / 2 + 1)
+                try await client.transport.sleep(micros: backoff / 2 + jitter)
+                backoff = min(options.maxBackoff, backoff * 2)
+            }
+        }
     }
 
     /// Sets a key and returns the commit's versionstamp (which becomes the key's version).

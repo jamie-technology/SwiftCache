@@ -6,8 +6,8 @@ extension Database {
     ///
     /// The client learns proxy and storage addresses from the cluster controller, so it
     /// must be able to reach every pod (run it inside the cluster).
-    public static func connect(coordinators: [String], options: DatabaseOptions = DatabaseOptions()) async throws -> Database {
-        let db = Database(coordinators: coordinators, transport: NIOClientTransport(), options: options)
+    public static func connect(coordinators: [String], options: DatabaseOptions = DatabaseOptions(), threads: Int = 2) async throws -> Database {
+        let db = Database(coordinators: coordinators, transport: NIOClientTransport(threads: threads), options: options)
         // Fail fast if the cluster is unreachable.
         _ = try await db.client.clientInfo(refresh: true)
         return db

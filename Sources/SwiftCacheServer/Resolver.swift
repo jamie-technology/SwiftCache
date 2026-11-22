@@ -66,11 +66,11 @@ struct ConflictSet {
     mutating func advance(oldest: Version) {
         guard oldest > oldestReadable else { return }
         oldestReadable = oldest
-        while let first = recent.first, first.version < oldest { recent.removeFirst() }
-        // Sweeping the point map is O(n); do it at most once per window.
-        if oldest > lastSweep &+ 1_000_000 {
-            lastWrite = lastWrite.filter { $0.value >= oldest }
-            lastSweep = oldest
+        // Expire incrementally (no stop-the-world sweeps): a key's entry goes when the
+        // write that last set it leaves the window.
+        while let first = recent.first, first.version < oldest {
+            recent.removeFirst()
+            for key in first.keys where lastWrite[key] == first.version { lastWrite[key] = nil }
         }
     }
 

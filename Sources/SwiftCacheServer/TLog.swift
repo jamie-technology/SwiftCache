@@ -36,8 +36,12 @@ public final class TLogRole: Role {
         var rid: UInt64
         var tag: Tag
         var after: Version
+        var need: Version
         var id: UInt64
     }
+    /// Per tag, the versions that carry data for it (ascending, trimmed on pop): lets a
+    /// held peek be answered only when its tag actually has something new.
+    private var tagVersions: [Tag: Deque<Version>] = [:]
     private var peekWaiters: [PeekWaiter] = []
     private var nextWaiterID: UInt64 = 0
 
@@ -83,7 +87,10 @@ public final class TLogRole: Role {
                 self.seed(attempt: attempt + 1)
                 return
             }
-            for e in f.entries where e.version <= self.spec.startVersion { self.entries.append(e) }
+            for e in f.entries where e.version <= self.spec.startVersion {
+                self.entries.append(e)
+                self.indexTags(e)
+            }
             for p in f.popped { self.popped[p.tag] = p.version }
             self.becomeReady()
         }
@@ -93,11 +100,17 @@ public final class TLogRole: Role {
         switch message {
         case .tlogPush(let rid, let push):
             handlePush(rid: rid, push: push, from: from)
-        case .tlogPeek(let rid, let tag, let after, let upTo):
-            handlePeek(rid: rid, tag: tag, after: after, upTo: upTo, from: from, waiterID: nil)
+        case .tlogPeek(let rid, let tag, let after, let upTo, let need):
+            // A consumer has at most one held peek per tag: answer a superseded one now.
+            if let i = peekWaiters.firstIndex(where: { $0.from == from && $0.tag == tag }) {
+                let old = peekWaiters.remove(at: i)
+                context.send(.tlogPeekReply(rid: old.rid, PeekReply(status: .ok, entries: [], end: old.after)), to: old.from)
+            }
+            handlePeek(rid: rid, tag: tag, after: after, upTo: upTo, need: need, from: from, waiterID: nil)
         case .tlogPop(let tag, let version):
             if let p = popped[tag], version > p {
                 popped[tag] = version
+                while let v = tagVersions[tag]?.first, v <= version { tagVersions[tag]!.removeFirst() }
                 collectGarbage()
             }
         case .tlogLock(let rid, let generation):
@@ -110,6 +123,9 @@ public final class TLogRole: Role {
             } else {
                 context.send(.tlogLockReply(rid: rid, LockReply(known: false, generation: spec.generation, durableVersion: 0, knownCommitted: 0)), to: from)
             }
+        case .tlogCommitted(let generation, let version):
+            guard ready, generation == spec.generation else { return }
+            advanceKnownCommitted(version)
         case .tlogConfirm(let rid, let generation):
             context.send(.tlogConfirmReply(rid: rid, ok: ready && !locked && generation == spec.generation), to: from)
         case .tlogFetch(let rid, let upTo):
@@ -162,10 +178,25 @@ public final class TLogRole: Role {
                 break
             }
         }
+        indexTags(e)
         entries.append(e)
         durable = e.version
         knownCommitted = min(durable, max(knownCommitted, push.knownCommitted))
-        // A committed snapshot supersedes everything older on the metadata tag.
+        compactSnapshots()
+    }
+
+    /// Learns that everything up to `version` is on every log of the generation.
+    private func advanceKnownCommitted(_ version: Version) {
+        let v = min(durable, version)
+        guard v > knownCommitted else { return }
+        knownCommitted = v
+        compactSnapshots()
+        collectGarbage()
+        wakePeekWaiters()
+    }
+
+    /// A committed snapshot supersedes everything older on the metadata tag.
+    private func compactSnapshots() {
         while let s = pendingSnapshots.first, s <= knownCommitted {
             pendingSnapshots.removeFirst()
             popped[metadataTag] = max(popped[metadataTag] ?? 0, s - 1)
@@ -179,7 +210,26 @@ public final class TLogRole: Role {
 
     // MARK: Peeks
 
-    private func handlePeek(rid: UInt64, tag: Tag, after requested: Version, upTo: Version, from: Endpoint, waiterID: UInt64?) {
+    private func indexTags(_ e: LogEntry) {
+        var touched = Set<Tag>()
+        for m in e.messages { touched.formUnion(m.tags) }
+        for tm in e.meta { touched.formUnion(tm.tags) }
+        for t in touched.sorted() { tagVersions[t, default: Deque()].append(e.version) }
+    }
+
+    /// Whether `tag` has data at a version in (after, limit].
+    private func hasData(_ tag: Tag, after: Version, through limit: Version) -> Bool {
+        guard let vs = tagVersions[tag] else { return false }
+        let all = vs.elements
+        var lo = all.startIndex, hi = all.endIndex
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if all[mid] <= after { lo = mid + 1 } else { hi = mid }
+        }
+        return lo < all.endIndex && all[lo] <= limit
+    }
+
+    private func handlePeek(rid: UInt64, tag: Tag, after requested: Version, upTo: Version, need: Version, from: Endpoint, waiterID: UInt64?) {
         guard ready else {
             context.send(.tlogPeekReply(rid: rid, PeekReply(status: .stopped, entries: [], end: requested)), to: from)
             return
@@ -195,19 +245,24 @@ public final class TLogRole: Role {
             return
         }
         let limit = upTo > 0 ? min(upTo, durable) : knownCommitted
-        if limit <= after {
-            if locked || upTo > 0 {
+        // Hold the request unless there's new data for the tag, the waiting read's version
+        // has become available, or the caller asked for a fixed range.
+        let answerable = upTo > 0 || locked || need == .max || (need > after && limit >= need) || hasData(tag, after: after, through: limit)
+        if limit <= after || !answerable {
+            if locked || upTo > 0 || need == .max {
                 context.send(.tlogPeekReply(rid: rid, PeekReply(status: locked ? .stopped : .ok, entries: [], end: after)), to: from)
                 return
             }
             // Long poll: answer when something new is committed, or after peekTimeout.
             let id = waiterID ?? { nextWaiterID += 1; return nextWaiterID }()
-            peekWaiters.append(PeekWaiter(from: from, rid: rid, tag: tag, after: after, id: id))
+            peekWaiters.append(PeekWaiter(from: from, rid: rid, tag: tag, after: after, need: need, id: id))
             if waiterID == nil {
                 context.schedule(after: config.peekTimeout) { [weak self] in
                     guard let self, let i = self.peekWaiters.firstIndex(where: { $0.id == id }) else { return }
                     let w = self.peekWaiters.remove(at: i)
-                    self.context.send(.tlogPeekReply(rid: w.rid, PeekReply(status: .ok, entries: [], end: w.after)), to: w.from)
+                    // Answer with whatever is committed (a full scan: the reply's content
+                    // never depends on the tag index, only its timing does).
+                    self.handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, need: .max, from: w.from, waiterID: w.id)
                 }
             }
             return
@@ -247,8 +302,10 @@ public final class TLogRole: Role {
         let waiting = peekWaiters
         peekWaiters = []
         for w in waiting {
-            if knownCommitted > w.after || locked {
-                handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, from: w.from, waiterID: w.id)
+            let ready = locked || (knownCommitted > w.after
+                && ((w.need > w.after && knownCommitted >= w.need) || hasData(w.tag, after: w.after, through: knownCommitted)))
+            if ready {
+                handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, need: w.need, from: w.from, waiterID: w.id)
             } else {
                 peekWaiters.append(w)
             }

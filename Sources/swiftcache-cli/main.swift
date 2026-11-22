@@ -193,27 +193,69 @@ struct WaitReady: AsyncParsableCommand {
 }
 
 struct Bench: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Simple throughput benchmark.")
+    static let configuration = CommandConfiguration(
+        abstract: "Throughput/latency benchmark (comparable to redis-benchmark: no pipelining, fixed value size, random keys).")
     @OptionGroup var conn: Connection
+    @Option(help: "get, set, mixed, or txn (read-modify-write of 2 keys).") var mode = "mixed"
     @Option var concurrency = 32
     @Option var seconds: Double = 10
     @Option var keys = 10_000
-    @Option(help: "Fraction of operations that are reads.") var readRatio = 0.8
+    @Option(help: "Value size in bytes.") var valueSize = 100
+    @Option(help: "Fraction of reads in mixed mode.") var readRatio = 0.8
+    @Option(help: "Client event-loop threads.") var threads = 4
+    @Flag(help: "Write every key before measuring.") var preload = false
 
     func run() async throws {
-        let db = try await conn.connect()
-        let end = Date().addingTimeInterval(seconds)
-        let keys = self.keys, readRatio = self.readRatio
+        let db = try await Database.connect(coordinators: conn.cluster.split(separator: ",").map(String.init),
+                                            threads: threads)
+        let keys = self.keys, mode = self.mode, readRatio = self.readRatio
+        let value = Bytes(repeating: UInt8(ascii: "x"), count: valueSize)
+        if preload || mode == "get" || mode == "read-at" {
+            try await withThrowingTaskGroup(of: Void.self) { g in
+                for w in 0..<concurrency {
+                    g.addTask {
+                        var i = w
+                        while i < keys {
+                            try await db.transaction { tr in
+                                for j in stride(from: i, to: min(keys, i + 50 * concurrency), by: concurrency) {
+                                    tr.set("bench/\(j)", bytes: value)
+                                }
+                            }
+                            i += 50 * concurrency
+                        }
+                    }
+                }
+                try await g.waitForAll()
+            }
+        }
+        let pinned = try await db.readVersion()
+        let start = Date()
+        let end = start.addingTimeInterval(seconds)
         let results = try await withThrowingTaskGroup(of: (Int, Int, [Double]).self) { group in
             for _ in 0..<concurrency {
                 group.addTask {
                     var ops = 0, errors = 0
                     var latencies: [Double] = []
+                    latencies.reserveCapacity(100_000)
                     while Date() < end {
                         let k = "bench/\(Int.random(in: 0..<keys))"
                         let t0 = Date()
                         do {
-                            if Double.random(in: 0..<1) < readRatio { _ = try await db.get(k) } else { try await db.set(k, "v\(ops)") }
+                            switch mode {
+                            case "grv": _ = try await db.createTransaction().readVersion()
+                            case "read-at": _ = try await db.read(atVersion: pinned) { try await $0.get(k) }
+                            case "get": _ = try await db.get(k)
+                            case "set": try await db.set(k, value)
+                            case "txn":
+                                let k2 = "bench/\(Int.random(in: 0..<keys))"
+                                try await db.transaction { tr in
+                                    let a = try await tr.get(k) ?? value
+                                    _ = try await tr.get(k2)
+                                    tr.set(k2, bytes: a)
+                                }
+                            default:
+                                if Double.random(in: 0..<1) < readRatio { _ = try await db.get(k) } else { try await db.set(k, value) }
+                            }
                             ops += 1
                             latencies.append(Date().timeIntervalSince(t0) * 1000)
                         } catch { errors += 1 }
@@ -225,9 +267,11 @@ struct Bench: AsyncParsableCommand {
             for try await r in group { all.append(r) }
             return all
         }
+        let elapsed = Date().timeIntervalSince(start)
         let ops = results.reduce(0) { $0 + $1.0 }, errors = results.reduce(0) { $0 + $1.1 }
         let lat = results.flatMap(\.2).sorted()
-        func pct(_ p: Double) -> String { lat.isEmpty ? "-" : String(format: "%.2fms", lat[min(lat.count - 1, Int(Double(lat.count) * p))]) }
-        print(String(format: "%.0f ops/s", Double(ops) / seconds) + "  errors=\(errors)  p50=\(pct(0.5)) p99=\(pct(0.99))")
+        func pct(_ p: Double) -> String { lat.isEmpty ? "-" : String(format: "%.2f", lat[min(lat.count - 1, Int(Double(lat.count) * p))]) }
+        print("\(mode): " + String(format: "%.0f ops/s", Double(ops) / elapsed)
+              + "  p50=\(pct(0.5))ms p99=\(pct(0.99))ms p99.9=\(pct(0.999))ms  errors=\(errors)")
     }
 }

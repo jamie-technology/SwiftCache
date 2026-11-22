@@ -7,6 +7,7 @@
 #      and then all coordinators at once (their state must survive on the PVCs);
 #      data must survive and verify must pass after each
 #   4. scale out to 3 shards; slots must rebalance and verify must pass
+#   5. rolling-restart every storage pod; no shard may lose data
 #   5. run a short benchmark
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -82,6 +83,13 @@ $K rollout status statefulset/swiftcache-storage --timeout=180s
 cli wait-ready --shards 3 --timeout 180
 cli get marker/a
 cli status --stats
+cli verify --min-shards 3
+
+step "Rolling restart of every storage pod (readiness gates on re-replication)"
+$K rollout restart statefulset/swiftcache-storage
+$K rollout status statefulset/swiftcache-storage --timeout=600s
+cli wait-ready --shards 3 --timeout 180
+cli get marker/a
 cli verify --min-shards 3
 
 step "Benchmark (10s, 32 concurrent, 80% reads)"

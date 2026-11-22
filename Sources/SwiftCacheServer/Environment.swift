@@ -103,7 +103,10 @@ public final class RoleContext {
     let env: any ProcessEnvironment
     public private(set) var stopped = false
     private var nextRid: UInt64 = 1
-    private var pending: [UInt64: (Message?) -> Void] = [:]
+    private var pending: [UInt64: (deadline: UInt64, completion: (Message?) -> Void)] = [:]
+    private var sweepScheduled = false
+    /// Granularity of request timeouts (one sweep timer per role, not one per request).
+    static let timeoutResolution: UInt64 = 10_000
     /// Called once when the role is ready to serve (used by recruitment).
     var onReady: (() -> Void)?
     /// Called when the role asks to stop itself.
@@ -155,18 +158,32 @@ public final class RoleContext {
         guard !stopped else { return }
         let rid = nextRid
         nextRid += 1
-        pending[rid] = completion
+        pending[rid] = (env.now + (timeout ?? 1_000_000), completion)
         env.send(make(rid), from: endpoint, to: to)
-        env.schedule(after: timeout ?? 1_000_000) { [weak self] in
-            guard let self, let c = self.pending.removeValue(forKey: rid) else { return }
-            if !self.stopped { c(nil) }
+        scheduleSweep()
+    }
+
+    private func scheduleSweep() {
+        guard !sweepScheduled, !pending.isEmpty else { return }
+        sweepScheduled = true
+        env.schedule(after: Self.timeoutResolution) { [weak self] in
+            guard let self else { return }
+            self.sweepScheduled = false
+            guard !self.stopped else { return }
+            let now = self.env.now
+            let expired = self.pending.filter { $0.value.deadline <= now }.keys.sorted()
+            for rid in expired {
+                guard let entry = self.pending.removeValue(forKey: rid) else { continue }
+                if !self.stopped { entry.completion(nil) }
+            }
+            self.scheduleSweep()
         }
     }
 
     /// Routes a reply to its waiting request. Returns false if nobody was waiting.
     func deliverReply(_ message: Message) -> Bool {
-        guard let rid = message.rid, let c = pending.removeValue(forKey: rid) else { return false }
-        c(message)
+        guard let rid = message.rid, let entry = pending.removeValue(forKey: rid) else { return false }
+        entry.completion(message)
         return true
     }
 
@@ -255,6 +272,13 @@ public final class ProcessHost: ProcessNode {
         }
         if message.isReply, role.context.deliverReply(message) { return }
         role.receive(message, from: from)
+    }
+
+    /// Readiness for orchestration (Kubernetes readiness probes): a storage process is
+    /// ready only once its replica is fully caught up, so rolling restarts never take
+    /// down the last good copy of a shard.
+    public var isReady: Bool {
+        role(StorageServer.self)?.isReadyForRollout ?? true
     }
 
     public func role<T: Role>(_ type: T.Type) -> T? {
