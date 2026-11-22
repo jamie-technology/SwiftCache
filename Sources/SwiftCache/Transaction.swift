@@ -1,0 +1,267 @@
+import Synchronization
+import SwiftCacheCore
+
+/// A serializable transaction with FoundationDB-style semantics.
+///
+/// * All reads see one consistent snapshot: the database as of the transaction's read
+///   version.
+/// * Writes are buffered locally and are visible to the transaction's own later reads
+///   (read-your-writes).
+/// * At commit, the transaction fails with `notCommitted` if any key or range it read was
+///   written by a transaction that committed after its read version. `Database.transaction`
+///   retries such failures automatically.
+/// * A transaction that commits writes gets a `Versionstamp`, recorded on every key it wrote.
+///
+/// Transactions are safe to use from multiple tasks (e.g. issue reads concurrently with
+/// `async let`), but should not be used after commit.
+public final class Transaction: Sendable {
+    enum LocalWrite: Sendable {
+        /// The key's value is known locally (nil = cleared).
+        case value(Bytes?)
+        /// Only a delta is known; the base must be read from storage.
+        case add(Int64)
+    }
+
+    struct State: Sendable {
+        var readVersion: Version?
+        var readVersionPinned = false
+        var writes: [Bytes: LocalWrite] = [:]
+        var mutations: [Mutation] = []
+        var readConflictKeys: Set<Bytes> = []
+        var readConflictRanges: [KeyRange] = []
+        var writeConflictKeys: Set<Bytes> = []
+        var committedStamp: Versionstamp?
+        var committed = false
+    }
+
+    let client: ClusterClient
+    let state = Mutex(State())
+
+    init(client: ClusterClient, readVersion: Version? = nil) {
+        self.client = client
+        if let readVersion {
+            state.withLock {
+                $0.readVersion = readVersion
+                $0.readVersionPinned = true
+            }
+        }
+    }
+
+    // MARK: Versions
+
+    /// The version this transaction reads at. Fetched from the coordinator on first use
+    /// (it is the latest committed version at that moment) unless set explicitly.
+    public func readVersion() async throws -> Version {
+        if let v = state.withLock({ $0.readVersion }) { return v }
+        // Concurrent first reads may both fetch; the first result wins so every read in
+        // the transaction uses the same version.
+        let v = try await client.readVersion()
+        return state.withLock { s in
+            if s.readVersion == nil { s.readVersion = v }
+            return s.readVersion!
+        }
+    }
+
+    /// Pins the read version, e.g. to read a historical snapshot or to continue reading
+    /// at the same version as an earlier transaction. Must be called before any read.
+    public func setReadVersion(_ version: Version) {
+        state.withLock {
+            $0.readVersion = version
+            $0.readVersionPinned = true
+        }
+    }
+
+    var isReadVersionPinned: Bool { state.withLock { $0.readVersionPinned } }
+
+    /// The versionstamp assigned at commit (nil before commit, or for read-only transactions).
+    public var committedVersionstamp: Versionstamp? { state.withLock { $0.committedStamp } }
+
+    // MARK: Reads
+
+    /// Reads a key's raw bytes. With `snapshot: true` the read adds no conflict.
+    public func get(_ key: some CacheKey, snapshot: Bool = false) async throws -> Bytes? {
+        try await getEntry(key.cacheKeyBytes, snapshot: snapshot)?.value
+    }
+
+    /// Reads a key and decodes it (JSON unless `T` is `String`, `[UInt8]` or `Data`).
+    public func get<T: Decodable>(_ key: some CacheKey, as type: T.Type, snapshot: Bool = false) async throws -> T? {
+        guard let bytes = try await get(key, snapshot: snapshot) else { return nil }
+        return try ValueCodec.decode(type, from: bytes)
+    }
+
+    /// Reads a key together with the versionstamp of the commit that wrote it.
+    /// Throws `invalidRequest` if this transaction has already written the key (its
+    /// versionstamp isn't known until commit).
+    public func getVersioned(_ key: some CacheKey, snapshot: Bool = false) async throws -> VersionedEntry? {
+        let k = key.cacheKeyBytes
+        if state.withLock({ $0.writes[k] != nil }) {
+            throw SwiftCacheError.invalidRequest("getVersioned on a key written in the same transaction")
+        }
+        guard let (value, stamp) = try await getEntry(k, snapshot: snapshot), let value else { return nil }
+        return VersionedEntry(key: k, bytes: value, versionstamp: stamp ?? .zero)
+    }
+
+    /// Returns (value, stamp) honoring local writes; stamp is nil for locally-written values.
+    private func getEntry(_ key: Bytes, snapshot: Bool) async throws -> (value: Bytes?, stamp: Versionstamp?)? {
+        try checkUsable()
+        let local = state.withLock { $0.writes[key] }
+        if case .value(let v) = local { return (v, nil) }
+        let version = try await readVersion()
+        let (value, stamp) = try await client.read(key, at: version)
+        if !snapshot { state.withLock { _ = $0.readConflictKeys.insert(key) } }
+        if case .add(let delta) = local {
+            return (LittleEndianInt64.encode(LittleEndianInt64.decode(value) &+ delta), nil)
+        }
+        return (value, value == nil ? nil : stamp)
+    }
+
+    /// Reads key/values in `[begin, end)` in key order (merging this transaction's writes).
+    public func getRange(from begin: some CacheKey, to end: some CacheKey, limit: Int = 1000, snapshot: Bool = false) async throws -> [VersionedEntry] {
+        try checkUsable()
+        let range = KeyRange(begin: begin.cacheKeyBytes, end: end.cacheKeyBytes)
+        guard bytesLess(range.begin, range.end), limit > 0 else { return [] }
+        let version = try await readVersion()
+        let local = state.withLock { s in s.writes.filter { range.contains($0.key) } }
+        let clears = local.values.filter { if case .value(nil) = $0 { return true } else { return false } }.count
+        let (entries, more) = try await client.readRange(range, at: version, limit: limit + clears)
+        // Overlay local writes.
+        var merged: [Bytes: (Bytes, Versionstamp)] = [:]
+        for e in entries { merged[e.key] = (e.value, e.stamp) }
+        // Local writes beyond the last server key (when truncated) can't be placed safely.
+        let horizon: Bytes? = more ? entries.last?.key : nil
+        for (key, w) in local {
+            if let h = horizon, bytesLess(h, key) { continue }
+            switch w {
+            case .value(let v):
+                if let v { merged[key] = (v, .zero) } else { merged[key] = nil }
+            case .add(let delta):
+                let base = merged[key]?.0
+                merged[key] = (LittleEndianInt64.encode(LittleEndianInt64.decode(base) &+ delta), .zero)
+            }
+        }
+        var result = merged.map { VersionedEntry(key: $0.key, bytes: $0.value.0, versionstamp: $0.value.1) }
+        result.sort { bytesLess($0.key, $1.key) }
+        let truncated = result.count > limit || more
+        if result.count > limit { result = Array(result.prefix(limit)) }
+        if !snapshot {
+            let conflictEnd = truncated ? (result.last?.key.keyAfter ?? range.begin.keyAfter) : range.end
+            state.withLock { $0.readConflictRanges.append(KeyRange(begin: range.begin, end: conflictEnd)) }
+        }
+        return result
+    }
+
+    /// Reads every key with the given prefix.
+    public func getRange(prefix: some CacheKey, limit: Int = 1000, snapshot: Bool = false) async throws -> [VersionedEntry] {
+        let p = prefix.cacheKeyBytes
+        return try await getRange(from: p, to: p.prefixEnd ?? [0xFF, 0xFF, 0xFF, 0xFF], limit: limit, snapshot: snapshot)
+    }
+
+    // MARK: Writes
+
+    /// Sets a key to raw bytes. A `ttl` (seconds) makes the value expire.
+    public func set(_ key: some CacheKey, bytes value: Bytes, ttl: Double? = nil) {
+        let k = key.cacheKeyBytes
+        let ttlMicros = ttl.map { UInt64(max(0, $0) * 1_000_000) } ?? 0
+        state.withLock { s in
+            s.writes[k] = .value(value)
+            s.mutations.append(.set(key: k, value: value, ttl: ttlMicros))
+            s.writeConflictKeys.insert(k)
+        }
+    }
+
+    /// Sets a key. `String`, `[UInt8]` and `Data` are stored raw; other values as JSON.
+    public func set<T: Encodable>(_ key: some CacheKey, _ value: T, ttl: Double? = nil) throws {
+        set(key, bytes: try ValueCodec.encode(value), ttl: ttl)
+    }
+
+    /// Deletes a key.
+    public func clear(_ key: some CacheKey) {
+        let k = key.cacheKeyBytes
+        state.withLock { s in
+            s.writes[k] = .value(nil)
+            s.mutations.append(.clear(key: k))
+            s.writeConflictKeys.insert(k)
+        }
+    }
+
+    /// Atomically adds `delta` to the little-endian Int64 at `key` (missing = 0) without
+    /// reading it, so concurrent adds never conflict with each other.
+    public func add(_ key: some CacheKey, _ delta: Int64) {
+        let k = key.cacheKeyBytes
+        state.withLock { s in
+            switch s.writes[k] {
+            case .value(let v)?:
+                s.writes[k] = .value(LittleEndianInt64.encode(LittleEndianInt64.decode(v) &+ delta))
+            case .add(let d)?:
+                s.writes[k] = .add(d &+ delta)
+            case nil:
+                s.writes[k] = .add(delta)
+            }
+            s.mutations.append(.add(key: k, delta: delta))
+            s.writeConflictKeys.insert(k)
+        }
+    }
+
+    /// Writes `newValue` only if the key's current versionstamp equals `expectedVersion`
+    /// (`nil` = the key must not exist). Throws `versionMismatch` otherwise. The check is
+    /// a conflict-tracked read, so it stays valid until commit.
+    public func compareAndSwap<T: Encodable>(key: some CacheKey, expectedVersion: Versionstamp?, newValue: T, ttl: Double? = nil) async throws {
+        let current = try await getVersioned(key)
+        guard current?.versionstamp == expectedVersion else {
+            throw SwiftCacheError.versionMismatch(key: key.cacheKeyBytes, expected: expectedVersion, actual: current?.versionstamp)
+        }
+        try set(key, newValue, ttl: ttl)
+    }
+
+    /// Like `compareAndSwap`, but deletes the key on success.
+    public func compareAndDelete(key: some CacheKey, expectedVersion: Versionstamp) async throws {
+        let current = try await getVersioned(key)
+        guard current?.versionstamp == expectedVersion else {
+            throw SwiftCacheError.versionMismatch(key: key.cacheKeyBytes, expected: expectedVersion, actual: current?.versionstamp)
+        }
+        clear(key)
+    }
+
+    /// Adds a read conflict on `key` as if it had been read.
+    public func addReadConflict(_ key: some CacheKey) {
+        state.withLock { _ = $0.readConflictKeys.insert(key.cacheKeyBytes) }
+    }
+
+    /// Adds a write conflict on `key` as if it had been written.
+    public func addWriteConflict(_ key: some CacheKey) {
+        state.withLock { _ = $0.writeConflictKeys.insert(key.cacheKeyBytes) }
+    }
+
+    // MARK: Commit
+
+    private func checkUsable() throws {
+        if state.withLock({ $0.committed }) {
+            throw SwiftCacheError.invalidRequest("transaction already committed")
+        }
+    }
+
+    /// Commits the transaction. Returns its versionstamp, or nil if it made no writes
+    /// (read-only transactions always succeed: their snapshot was consistent).
+    @discardableResult
+    public func commit() async throws -> Versionstamp? {
+        try checkUsable()
+        let s = state.withLock { $0 }
+        if s.mutations.isEmpty && s.writeConflictKeys.isEmpty {
+            state.withLock { $0.committed = true }
+            return nil
+        }
+        let readVersion = try await self.readVersion()
+        let request = CommitRequest(
+            readVersion: readVersion,
+            readConflictKeys: s.readConflictKeys.sorted(by: bytesLess),
+            readConflictRanges: s.readConflictRanges,
+            writeConflictKeys: s.writeConflictKeys.sorted(by: bytesLess),
+            mutations: s.mutations)
+        let stamp = try await client.commit(request)
+        state.withLock {
+            $0.committed = true
+            $0.committedStamp = stamp
+        }
+        return stamp
+    }
+}
