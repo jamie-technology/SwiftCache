@@ -93,3 +93,44 @@ public struct WireReader {
         return SlotSet(ranges: ranges)
     }
 }
+
+/// A type with a hand-written binary encoding (deterministic, compact, fast).
+public protocol WireCodable: Sendable {
+    func encode(to w: inout WireWriter)
+    init(from r: inout WireReader) throws
+}
+
+extension WireWriter {
+    public mutating func put<T: WireCodable>(_ v: T) { v.encode(to: &self) }
+    public mutating func put<T: WireCodable>(_ v: T?) {
+        if let v { bool(true); v.encode(to: &self) } else { bool(false) }
+    }
+    public mutating func put<T: WireCodable>(_ vs: [T]) {
+        u32(UInt32(vs.count))
+        for v in vs { v.encode(to: &self) }
+    }
+    public mutating func strings(_ vs: [String]) { array(vs) { $0.string($1) } }
+    public mutating func blobs(_ vs: [Bytes]) { array(vs) { $0.blob($1) } }
+    public mutating func u32s(_ vs: [UInt32]) { array(vs) { $0.u32($1) } }
+    public mutating func optionalString(_ v: String?) { if let v { bool(true); string(v) } else { bool(false) } }
+}
+
+extension WireReader {
+    public mutating func get<T: WireCodable>(_: T.Type = T.self) throws -> T { try T(from: &self) }
+    public mutating func getOptional<T: WireCodable>(_: T.Type = T.self) throws -> T? { try bool() ? try T(from: &self) : nil }
+    public mutating func getArray<T: WireCodable>(_: T.Type = T.self) throws -> [T] { try array { try T(from: &$0) } }
+    public mutating func strings() throws -> [String] { try array { try $0.string() } }
+    public mutating func blobs() throws -> [Bytes] { try array { try $0.blob() } }
+    public mutating func u32s() throws -> [UInt32] { try array { try $0.u32() } }
+    public mutating func optionalString() throws -> String? { try bool() ? try string() : nil }
+}
+
+extension Versionstamp: WireCodable {
+    public func encode(to w: inout WireWriter) { w.stamp(self) }
+    public init(from r: inout WireReader) throws { self = try r.stamp() }
+}
+
+extension SlotSet: WireCodable {
+    public func encode(to w: inout WireWriter) { w.slots(self) }
+    public init(from r: inout WireReader) throws { self = try r.slots() }
+}

@@ -1,90 +1,149 @@
 # Deterministic simulation
 
-SwiftCache follows FoundationDB's approach: the production code is written to run inside a
-deterministic simulator, and most correctness testing happens there. A simulation runs a whole
-cluster (coordinator, storage servers and clients) on **one thread**, with a **virtual clock**,
-a **seeded RNG** and a **simulated network**, while injecting faults. The same seed always
-produces exactly the same execution, so any failure can be replayed and debugged.
+SwiftCache follows FoundationDB's approach: production code is written to run inside a
+deterministic simulator, and most correctness testing happens there. A simulation runs a
+whole cluster on **one thread**, with a **virtual clock**, a **seeded RNG**, a
+**simulated network** and **simulated disks**, while injecting faults:
+
+- coordinators, stateless processes (controller, master, proxies, resolver), log processes,
+  storage processes and clients;
+- the real server roles and the real Swift client library.
+
+The same seed always produces exactly the same execution, so any failure can be replayed
+and debugged.
 
 ```bash
-swift run -c release swiftcache-sim --count 500                 # seeds 1..500
-swift run -c release swiftcache-sim --seed 57 --verbose         # replay a single seed with full logs
+swift run -c release swiftcache-sim --count 500                      # random chaos, seeds 1..500
+swift run -c release swiftcache-sim --scenario all --count 25        # every targeted scenario × 25 seeds
+swift run -c release swiftcache-sim --scenario staleController --seed 3 --verbose
 swift run -c release swiftcache-sim --count 20 --check-determinism
-swift run -c release swiftcache-sim --replicas 2 --storage 4 --scale-out 4 --seconds 60
+swift run -c release swiftcache-sim --storage-faults-only            # leave the transaction system alone
 ```
 
-`swift test` runs a handful of seeds plus a determinism check.
+`swift test` runs a few chaos seeds, every scenario once, and a determinism check.
 
 ## What makes it deterministic
 
 | Source of nondeterminism | How it's controlled |
 | --- | --- |
-| Time | Nodes only see `NodeEnvironment.now`; the simulator advances a virtual clock event by event. |
-| Randomness | `NodeEnvironment.random` and the client transport draw from one seeded xoshiro256** generator. |
+| Time | Roles only see `ProcessEnvironment.now`; the simulator advances a virtual clock event by event. |
+| Randomness | Role ids, election jitter, workload choices and network latency all come from one seeded xoshiro256** generator. |
 | Network | `Simulator.send` decides latency from the RNG and delivers through a time-ordered event queue. |
-| Threads (server) | Server nodes are synchronous state machines called one event at a time. |
-| Threads (client) | The **real async client library** runs on `SimExecutor`, a custom Swift `TaskExecutor` that queues jobs and runs them on the simulator thread, in FIFO order, between events. All client tasks are created with that executor preference (child tasks inherit it), and the transport resumes continuations from simulator events. Task interleavings are a pure function of the seed. |
-| Hash ordering | Swift's `Dictionary` iteration order is randomized per process, so the code always sorts keys before iterating when order affects behaviour. |
+| Disk | `SimDisk` per process, which survives kill and restart (coordinator state). |
+| Threads (server) | Roles are synchronous state machines called one event at a time. |
+| Threads (client) | The real async client library runs on `SimExecutor`, a custom Swift `TaskExecutor` that runs queued jobs on the simulator thread, in FIFO order, between events. Task interleavings are a pure function of the seed. |
+| Hash ordering | Swift's `Dictionary` order is randomized per process, so code always sorts keys before iterating where order matters. |
 
-Each run computes a trace hash over every delivered message and fault. The determinism test runs
-a seed twice and compares hashes.
+Each run hashes every delivered message and fault into a trace hash. The determinism check
+runs a seed twice and compares the hashes.
 
 ## Network model
 
-- Per-directed-link FIFO delivery (like TCP), with random latency (100µs–2ms by default) plus
-  occasional spikes.
-- **Connections break.** Killing, restarting or partitioning a process bumps the epoch of all its
-  links, and in-flight messages on old links are dropped, as when a TCP connection resets.
-- Every message is round-tripped through the binary codec, so encoding bugs show up in
-  simulation.
+- Per-link FIFO delivery (like TCP) between processes, with random latency (100 µs–2 ms)
+  and occasional 200 ms spikes.
+- **Connections break.** Killing, restarting or partitioning a process drops everything in
+  flight to or from it, as a TCP reset does.
+- Every message is round-tripped through the binary codec.
 
-## Faults injected (`scheduleChaos`)
+## Random chaos
 
-- Kill a storage server, then restart it with empty memory 0.2–3.2s later.
-- Partition a storage server for 0.1–2.6s.
-- Kill the coordinator and restart it 0.1–1.6s later (full recovery from storage reports).
-- Partition the coordinator for 50–850ms.
-- Latency storms: up to 20ms one-way for a second.
-- Scale-out: three new storage servers join a quarter of the way through, forcing shard
-  formation and live slot migration under load and faults.
+Faults are injected every 0.2–0.8 s, but only while the cluster is fully healthy (judged by
+both the simulator's ground truth and the controller's view). So, by design, no shard ever
+loses every replica and no generation loses every log:
 
-Storage faults are only injected when the cluster is fully healthy, judged by both the
-simulator's ground truth and the coordinator's view. So at most one replica of any shard is down
-at once, and the data is always recoverable. (Killing every replica of an in-memory shard *does*
-lose its data. That is correct behaviour, not a bug.)
-
-## Workloads and invariants
-
-| Workload | What it checks |
+| Fault | What it exercises |
 | --- | --- |
-| **bank** | Random transfers between 20 accounts. Audits (point reads or a cross-shard range read) must always total 2,000. Checks serializability and range-read consistency. |
-| **cycle** | 16 keys form a permutation cycle mutated by 3-key swaps (FoundationDB's classic test). It must remain one cycle of length 16. |
-| **cas** | `getVersioned` + `compareAndSwap` increments, both inside one transaction and across two transactions (the `versionMismatch` path), each writing `cas/log/<n>` atomically with the counter. The log must be exactly `1...counter`: no lost or duplicated updates. Versionstamps in mismatches must move forward. |
-| **add** | Blind atomic adds. The final total must lie within [acknowledged, attempted]. |
-| **history** | Writes with versionstamps, then re-reads earlier writes at their commit version (`read(atVersion:)`). Must see exactly that value and versionstamp; reads just before a write must not see it. Versionstamps must increase. Checks MVCC and historical reads across crashes, migrations and recoveries. |
+| Kill a storage process, restart it 0.2–3.2 s later (empty) | Replica removal and re-replication (`addReplica` snapshot copy) |
+| Partition a storage process | Catch-up from the logs, or removal and re-add |
+| Kill a log process | Recovery onto the surviving logs, then restoring 3 logs |
+| Kill a stateless / coordinator process | Losing the controller, master, proxies or resolver |
+| Crash a single role (master, proxy, resolver, log, controller) inside a live process | Role-level failure detection and recovery |
+| Partition the controller's process | Lease step-down, re-election, fencing |
+| Kill a coordinator majority for 1–4 s | No progress without quorum, then recovery |
+| Partition a coordinator or log | Lock and recovery with unreachable participants |
+| Latency storms (20 ms) | Timeouts, retries, duplicate requests |
+| Scale-out: 3 storage servers join mid-run | Shard formation and live migration under faults |
 
-After the fault period every process is healed, the cluster quiesces, and a fresh client re-checks
-all invariants. The run also fails if a workload made no progress at all, or if scale-out didn't
-produce new shards.
+## Targeted scenarios
 
-## Bugs the simulator found during development
+`--scenario <name>`, each also running the full workload mix:
 
-These all passed ordinary local testing:
+| Scenario | Faults | Asserts |
+| --- | --- | --- |
+| `staleController` | Partition the controller's process for 5 s | It steps down within 1 s; a new controller is elected elsewhere; exactly one remains after healing |
+| `dualElection` | Kill the controller's process 6 times while partitioning coordinators | Never two leaders at once (continuous check) |
+| `sequencerDies` | Crash the running master 5 times | Versions never reused or regressing across generations |
+| `proxyDiesAfterLogging` | Crash commit proxies every 300 ms | Idempotent operations apply exactly once; no acknowledged commit lost |
+| `logDiesDuringReplication` | Kill log processes under load | No acknowledged commit lost; durability policy restored |
+| `storageFallsBehind` | Cut one replica off for 0.9 s, three times | It catches up from the logs (not replaced) and ends identical to its peers |
+| `oldGenerationReconnects` | Partition the running generation's master and proxies (keeping a coordinator majority reachable) | A new generation forms meanwhile; after healing the old roles stop without committing anything |
+| `coordinatorQuorumLoss` | Kill 2 of 3 coordinators for 5 s | No new generation forms without quorum; the running one keeps committing; recovery after they return |
 
-1. **Replica self-wipe on version gaps.** A brief coordinator partition dropped batches. Every
-   replica saw a gap and wiped itself, losing whole shards. Fix: the coordinator retains
-   unacknowledged batches and resends them.
-2. **False failure detection.** One dead replica stalled the commit pipeline, healthy replicas
-   stopped receiving batches (so stopped acknowledging), and all were declared failed. Fix:
-   only count time spent owing an acknowledgement.
-3. **Recovery declaring an empty cluster.** A coordinator partitioned during recovery lost all its
-   `recover` replies and bootstrapped a fresh, empty cluster. Fix: resend, and require every
-   shard to confirm, or restart recovery.
-4. **Double-applied adds** after commits with unknown results (see transactions.md).
+## Invariants checked in every run
+
+**Continuously (every 20 ms):**
+
+- At most one master ever completes recovery of a given generation.
+- Each generation's first version is above everything the previous generation committed.
+- Never two processes that both believe they are the controller.
+
+**By workloads:**
+
+| Workload | Invariant |
+| --- | --- |
+| **bank** | Random transfers between 20 accounts. Audits (point reads or a cross-shard range read) always total 2,000 (serializability). |
+| **cycle** | 16 keys form a permutation cycle mutated by 3-key swaps (FoundationDB's classic test). It stays one cycle. |
+| **cas** | `getVersioned` + `compareAndSwap` increments, in one transaction and across two (the `versionMismatch` path), each writing `cas/log/<n>` atomically. The log is exactly `1...counter`. |
+| **add** | Idempotent atomic adds. The total equals the acknowledged adds exactly (plus at most one per add that gave up with an unknown outcome). |
+| **orders** | Idempotent transactions that generate a **new id per attempt**. Every acknowledged id exists, no id is returned twice, and the count equals the number of orders. |
+| **history** | Writes, then re-reads earlier writes at their commit version (`read(atVersion:)`). Exact match; reads before a write don't see it. |
+| **global** | No versionstamp is ever handed to two commits. |
+
+**At the end**, after healing and quiescing: every invariant is re-checked by a fresh client;
+all active replicas of each shard hold identical data at a common version; every workload
+made progress; and the cluster has a controller and fully replicated shards.
+
+## Bugs the simulator found
+
+**Milestone 1 (single coordinator):**
+
+1. Replicas wiped themselves after a brief coordinator partition (version gap).
+2. A stalled commit pipeline made healthy replicas look dead.
+3. A partition during recovery made the coordinator bootstrap an empty cluster.
+
+**Milestone 2 (distributed transaction system):**
+
+4. **A lost version-request reply wedged a generation.** A proxy with two outstanding version
+   requests retried the first after its reply was lost. The master only remembered its last
+   reply per proxy, so it allocated a *new* version. The original version was never pushed,
+   and every log waited for it forever. Fix: the master (and resolver) remember recent
+   replies per request. Backstop: a master whose generation stops committing ends it.
+5. Proxies recruited during recovery asked for versions before the master considered itself
+   running, and shut themselves down.
+6. A controller role killed on its own left its candidate renewing the lease with no
+   controller behind it.
+7. Leases measured from heartbeat *replies* could outlive the coordinators' view under
+   latency spikes. They are now measured from heartbeat *sends*.
+8. Roles from generations run by a previous controller were never halted. They were harmless
+   (fenced), but lingered.
+9. A generation formed while a log process was down stayed at 2 of 3 logs indefinitely.
+10. **Acknowledged write lost during a migration.** After a partition, a proxy's timed-out
+    version requests were retried on independent timers and reached the master out of
+    order. The master handed out versions in arrival order, so the proxy's batches were no
+    longer in version order. The proxy then skipped a relayed `createShard` as "already
+    applied" and routed a mid-migration write without the destination shard. Fix: the
+    master serves each proxy's requests strictly in request-number order (as FoundationDB
+    does), and a proxy that ever sees its batch versions go backwards ends its generation.
+11. **Shard map lost in recovery.** A log compacted the metadata tag as soon as it stored a
+    new shard-map snapshot. That snapshot's version was above the recovery version (it wasn't
+    on every log yet), so recovery discarded it, and the history it had replaced was already
+    gone. The cluster came back with an empty map. Fix: compact only once the snapshot is
+    known committed on every log.
 
 ## Writing new workloads
 
-A workload is an `async` function taking a `Database` built on `sim.makeClientTransport()`. Use
-`sim.random` for every random choice, `sim.now` for time, and `sim.fail(...)` to record a
-violation. Never use `Date()`, `Task.sleep`, `UInt64.random` or unstructured `Task {}` inside
-simulated code; they escape the deterministic executor or the virtual clock.
+A workload is an `async` function taking a `Database` built on
+`sim.makeClientTransport()`. Use `sim.random` for every random choice, `sim.now` for time,
+and `sim.fail(...)` to record a violation. Never use `Date()`, `Task.sleep`,
+`UInt64.random` or unstructured `Task {}` in simulated code: they escape the deterministic
+executor or the virtual clock.

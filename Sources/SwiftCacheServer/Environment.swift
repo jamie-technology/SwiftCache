@@ -5,70 +5,263 @@ public enum LogLevel: Int, Sendable, Comparable {
     public static func < (a: LogLevel, b: LogLevel) -> Bool { a.rawValue < b.rawValue }
 }
 
-/// Everything a server node is allowed to do to the outside world. The production
-/// runtime implements it with SwiftNIO; the simulator implements it with a virtual clock,
-/// a seeded RNG and a simulated network. Nodes must not touch clocks, threads, sockets or
-/// unseeded randomness directly — that is what keeps simulations deterministic.
-public protocol NodeEnvironment: AnyObject {
+/// Small, synchronous, durable key/value storage for a process (coordinator state).
+/// Production writes files with fsync; the simulator keeps it across process restarts.
+public protocol Disk: AnyObject {
+    func read(_ key: String) -> Bytes?
+    func write(_ key: String, _ value: Bytes)
+}
+
+/// Everything a process is allowed to do to the outside world. The production runtime
+/// implements it with SwiftNIO; the simulator with a virtual clock, a seeded RNG and a
+/// simulated network. Roles never touch clocks, threads, sockets or unseeded randomness
+/// directly — that is what keeps simulations deterministic.
+public protocol ProcessEnvironment: AnyObject {
+    /// This process's network address (`host:port`).
+    var address: Endpoint { get }
     /// Monotonic time in microseconds.
     var now: UInt64 { get }
-    /// Wall-clock-ish microseconds used to seed commit versions (equal to `now` in simulation).
+    /// Wall-clock-ish microseconds used to seed commit versions.
     var versionClock: UInt64 { get }
-    func send(_ message: Message, to endpoint: Endpoint)
+    var disk: any Disk { get }
+    func send(_ message: Message, from: Endpoint, to: Endpoint)
     func schedule(after micros: UInt64, _ action: @escaping () -> Void)
     func random(_ upperBound: UInt64) -> UInt64
     func log(_ level: LogLevel, _ message: @autoclosure () -> String)
 }
 
-/// A message-driven server process.
-public protocol ServerNode: AnyObject {
-    var endpoint: Endpoint { get }
+/// A process as seen by its runtime: it receives every message addressed to any of its
+/// role endpoints.
+public protocol ProcessNode: AnyObject {
     func start()
-    func receive(_ message: Message, from: Endpoint)
+    func receive(_ message: Message, from: Endpoint, to: Endpoint)
 }
 
-/// Tunables shared by the coordinator and storage servers. All durations are in
-/// microseconds (which is also the unit of versions).
+/// Tunables. All durations are in microseconds (also the unit of versions).
 public struct ClusterConfig: Sendable, Hashable {
-    /// Replicas per shard. A shard is formed once this many unassigned servers are available.
+    /// Storage replicas per shard.
     public var replicationFactor = 2
+    /// Transaction logs per generation (a commit needs all of them).
+    public var logReplicas = 3
+    public var commitProxies = 2
+    public var resolvers = 1
     /// How far back (in versions ≈ µs) reads are guaranteed to be served.
     public var mvccWindow: UInt64 = 10_000_000
-    /// How often the coordinator considers forming a batch.
+
+    // Commit pipeline.
     public var batchInterval: UInt64 = 1_000
-    /// Maximum time between batches when idle (heartbeat / version advance).
     public var idleBatchInterval: UInt64 = 10_000
-    /// Maximum unacknowledged batches in flight.
-    public var maxInflightBatches = 16
-    /// Maximum transactions per batch.
+    public var maxInflightBatches = 8
     public var maxTransactionsPerBatch = 2_000
-    /// A storage server that hasn't acknowledged a batch for this long is marked failed.
+
+    // Coordination and failure detection.
+    /// Coordinators keep a nominee this long without a heartbeat.
+    public var leaseTimeout: UInt64 = 1_000_000
+    public var leaderHeartbeatInterval: UInt64 = 150_000
+    /// A leader that hasn't had a majority of heartbeat acks for this long steps down
+    /// (must be well under `leaseTimeout`).
+    public var leaderStepDownTimeout: UInt64 = 600_000
+    public var registrationInterval: UInt64 = 200_000
+    /// A process that hasn't registered for this long is considered dead.
     public var failureTimeout: UInt64 = 1_500_000
-    /// How long the *last* live replica of a shard may be silent before it is declared
-    /// failed (and the shard's data given up as lost). Until then, commits stall.
+    /// How long the *last* replica of a shard may be gone before its data is given up.
     public var shardLossTimeout: UInt64 = 60_000_000
-    /// How long a (re)starting coordinator waits for storage servers to report.
-    public var recoveryWindow: UInt64 = 2_000_000
-    /// How long recovery waits for truncation acknowledgements before giving up on a server.
-    public var recoveryTruncateTimeout: UInt64 = 1_500_000
-    /// A storage server that hasn't heard from the coordinator for this long starts rejoining.
-    public var coordinatorTimeout: UInt64 = 1_000_000
-    /// Interval between join attempts.
-    public var joinInterval: UInt64 = 250_000
-    /// How long a storage server waits for a snapshot before retrying another source.
+    /// A new controller waits this long for registrations before its first recovery.
+    public var controllerWarmup: UInt64 = 1_000_000
+    /// A recovery that hasn't completed in this long is abandoned and retried.
+    public var recoveryTimeout: UInt64 = 6_000_000
+    /// Default timeout for role-to-role requests.
+    public var requestTimeout: UInt64 = 1_000_000
+
+    // Storage.
+    public var peekTimeout: UInt64 = 200_000
+    public var popInterval: UInt64 = 100_000
     public var snapshotTimeout: UInt64 = 5_000_000
-    /// How long a read waits for a version to arrive before failing with future_version.
     public var readWaitTimeout: UInt64 = 1_000_000
-    /// Slots moved per data-movement step when rebalancing.
     public var migrationChunkSlots = 2_048
-    /// A data movement that hasn't completed in this long is aborted.
     public var moveTimeout: UInt64 = 30_000_000
-    /// Keys per snapshot chunk message.
     public var snapshotChunkKeys = 1_000
-    /// Limits.
+
+    /// Halt transaction roles left over from previous generations (debug switch).
+    public var haltStrayRoles = true
+
+    // Limits.
     public var maxKeySize = 10_000
     public var maxValueSize = 1_000_000
     public var maxTransactionBytes = 10_000_000
 
     public init() {}
 }
+
+// MARK: - Roles
+
+/// A role's view of its process: its own endpoint, timers that die with the role, and a
+/// request/reply helper. Each role is an independent state machine with its own
+/// lifecycle; a process may host any number of them.
+public final class RoleContext {
+    public let endpoint: Endpoint
+    let env: any ProcessEnvironment
+    public private(set) var stopped = false
+    private var nextRid: UInt64 = 1
+    private var pending: [UInt64: (Message?) -> Void] = [:]
+    /// Called once when the role is ready to serve (used by recruitment).
+    var onReady: (() -> Void)?
+    /// Called when the role asks to stop itself.
+    var onStop: (() -> Void)?
+
+    init(endpoint: Endpoint, env: any ProcessEnvironment) {
+        self.endpoint = endpoint
+        self.env = env
+    }
+
+    public var now: UInt64 { env.now }
+    public var versionClock: UInt64 { env.versionClock }
+    public var disk: any Disk { env.disk }
+    public var processAddress: Endpoint { env.address }
+
+    public func send(_ message: Message, to: Endpoint) {
+        guard !stopped else { return }
+        env.send(message, from: endpoint, to: to)
+    }
+
+    public func schedule(after micros: UInt64, _ action: @escaping () -> Void) {
+        env.schedule(after: micros) { [weak self] in
+            guard let self, !self.stopped else { return }
+            action()
+        }
+    }
+
+    /// Repeats `action` every `interval` until the role stops.
+    public func every(_ interval: UInt64, _ action: @escaping () -> Void) {
+        schedule(after: interval) { [weak self] in
+            action()
+            self?.every(interval, action)
+        }
+    }
+
+    public func random(_ upperBound: UInt64) -> UInt64 { env.random(upperBound) }
+    public func randomID() -> UInt64 { env.random(.max) | 1 }
+
+    public func log(_ level: LogLevel, _ message: @autoclosure () -> String) {
+        env.log(level, "\(shortName): \(message())")
+    }
+
+    /// The endpoint without the process's port noise, for logs.
+    public var shortName: String { endpoint }
+
+    /// Sends a request and calls `completion` with the reply, or nil on timeout.
+    public func request(to: Endpoint, timeout: UInt64? = nil, _ make: (UInt64) -> Message,
+                        _ completion: @escaping (Message?) -> Void) {
+        guard !stopped else { return }
+        let rid = nextRid
+        nextRid += 1
+        pending[rid] = completion
+        env.send(make(rid), from: endpoint, to: to)
+        env.schedule(after: timeout ?? 1_000_000) { [weak self] in
+            guard let self, let c = self.pending.removeValue(forKey: rid) else { return }
+            if !self.stopped { c(nil) }
+        }
+    }
+
+    /// Routes a reply to its waiting request. Returns false if nobody was waiting.
+    func deliverReply(_ message: Message) -> Bool {
+        guard let rid = message.rid, let c = pending.removeValue(forKey: rid) else { return false }
+        c(message)
+        return true
+    }
+
+    public func ready() {
+        let r = onReady
+        onReady = nil
+        r?()
+    }
+
+    /// Stops this role: no more sends, timers or callbacks; the host forgets it.
+    public func stopSelf() {
+        guard !stopped else { return }
+        stopped = true
+        pending = [:]
+        onStop?()
+    }
+
+    func markStopped() {
+        stopped = true
+        pending = [:]
+    }
+}
+
+public protocol Role: AnyObject {
+    var context: RoleContext { get }
+    func start()
+    func receive(_ message: Message, from: Endpoint)
+}
+
+/// Hosts the roles of one process and routes messages to them.
+public final class ProcessHost: ProcessNode {
+    public let env: any ProcessEnvironment
+    public private(set) var roles: [Endpoint: any Role] = [:]
+    private var startActions: [() -> Void] = []
+    public let processClass: ProcessClass
+
+    public init(env: any ProcessEnvironment, processClass: ProcessClass) {
+        self.env = env
+        self.processClass = processClass
+    }
+
+    public var address: Endpoint { env.address }
+
+    /// A fresh role endpoint on this process.
+    public func makeEndpoint(_ kind: String, unique: Bool = true) -> Endpoint {
+        if !unique { return "\(env.address)#\(kind)" }
+        let id = String(env.random(0xFFFF_FFFF), radix: 16)
+        return "\(env.address)#\(kind)-\(id)"
+    }
+
+    public func makeContext(_ endpoint: Endpoint) -> RoleContext {
+        RoleContext(endpoint: endpoint, env: env)
+    }
+
+    /// Adds and starts a role.
+    public func add(_ role: any Role) {
+        let ep = role.context.endpoint
+        roles[ep] = role
+        role.context.onStop = { [weak self] in self?.roles[ep] = nil }
+        role.start()
+    }
+
+    /// Stops and removes a role.
+    public func remove(_ endpoint: Endpoint) {
+        guard let role = roles.removeValue(forKey: endpoint) else { return }
+        role.context.markStopped()
+        env.log(.info, "\(endpoint): halted")
+    }
+
+    public func onStart(_ action: @escaping () -> Void) { startActions.append(action) }
+
+    public func start() {
+        let actions = startActions
+        startActions = []
+        for a in actions { a() }
+    }
+
+    public func receive(_ message: Message, from: Endpoint, to: Endpoint) {
+        guard let role = roles[to] else {
+            // A definitive "this role doesn't exist (any more)": role endpoints are unique
+            // per incarnation, so the sender can treat it as permanent.
+            if let rid = message.rid, !message.isReply {
+                env.send(.errorReply(rid: rid, .staleGeneration), from: to, to: from)
+            }
+            return
+        }
+        if message.isReply, role.context.deliverReply(message) { return }
+        role.receive(message, from: from)
+    }
+
+    public func role<T: Role>(_ type: T.Type) -> T? {
+        for ep in roles.keys.sorted() { if let r = roles[ep] as? T { return r } }
+        return nil
+    }
+}
+
+/// Majority size for `n` voters.
+@inlinable public func majority(_ n: Int) -> Int { n / 2 + 1 }

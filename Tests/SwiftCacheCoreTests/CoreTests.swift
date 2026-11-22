@@ -39,25 +39,45 @@ import Testing
     @Test func everyMessageRoundTrips() throws {
         var topo = Topology.empty
         topo.slotOwner[5] = 1
-        topo.shards = [.init(id: 1, replicas: ["a:1", "b:2"])]
+        topo.shards = [.init(id: 1, replicas: ["a:1#storage-1", "b:2#storage-2"])]
+        var map = ShardMap()
+        map.apply(.createShard(shard: 0, members: [ShardMember(tag: 1, endpoint: "s:1#storage-a", active: true)], slots: .all), at: 5)
+        let entry = LogEntry(version: 10, messages: [LogMessage(order: 0, mutation: .set(key: [1], value: [2], ttl: 0), tags: [1, 2])],
+                             meta: [TaggedMeta(op: .snapshot(map), tags: [metadataTag])])
         let messages: [Message] = [
             .getReadVersion(rid: 1),
             .readVersionReply(rid: 2, version: 99),
             .commit(rid: 3, CommitRequest(readVersion: 7, readConflictKeys: [[1]], readConflictRanges: [KeyRange(begin: [1], end: [2])],
-                                          writeConflictKeys: [[3]], mutations: [.set(key: [1], value: [2], ttl: 5), .clear(key: [3]), .add(key: [4], delta: -9)])),
+                                          writeConflictKeys: [[3]], mutations: [.set(key: [1], value: [2], ttl: 5), .clear(key: [3]), .add(key: [4], delta: -9)],
+                                          idempotencyID: [9, 9], idempotencyRetention: 60, attemptID: 77,
+                                          metaOps: [.addReplica(shard: 1, member: ShardMember(tag: 3, endpoint: "x", active: false), moveID: 4, sources: ["y"], slots: SlotSet([1]))])),
             .commitReply(rid: 4, .committed(Versionstamp(version: 9, order: 1))),
             .commitReply(rid: 5, .failed(.notCommitted)),
-            .topologyReply(rid: 6, topo),
-            .read(rid: 7, key: [1, 2], version: 3),
-            .readReply(rid: 8, value: nil, stamp: .zero),
+            .clientInfoReply(rid: 6, ClientInfo(generation: 3, proxies: ["p:1#proxy-1"], topology: topo)),
+            .readRange(rid: 7, range: KeyRange(begin: [1], end: [2]), version: 3, limit: 10),
             .rangeReply(rid: 9, entries: [KeyValueEntry(key: [1], value: [2], stamp: .zero)], more: true, servedSlots: SlotSet([1, 2])),
-            .join(StorageReport(endpoint: "x:1", shardID: 2, coordinatorEpoch: 3, appliedVersion: 4, committedVersion: 3, isActive: true, ownedSlots: .all)),
-            .batch(Batch(coordinatorEpoch: 1, version: 10, prevVersion: 9, committedVersion: 8, oldestVersion: 1,
-                         entries: [.init(order: 0, mutations: [.clear(key: [9])])],
-                         meta: [.beginReceive(moveID: 1, shardID: 2, slots: SlotSet([7]), sources: ["s:1"]),
-                                .transfer(moveID: 1, slots: SlotSet([7]), from: 1, to: 2), .gainEmpty(shardID: 3, slots: SlotSet([8])),
-                                .abortReceive(moveID: 4, shardID: 5)])),
-            .snapshotChunk(rid: 10, SnapshotChunk(version: 5, items: [.init(key: [1], versions: [VersionedValue(stamp: .zero, value: nil, expiresAt: 3)])], done: true)),
+            .candidacy(rid: 10, LeaderInfo(endpoint: "c:1#cc-1", changeID: 42)),
+            .nominationReply(rid: 11, nil),
+            .genReadReply(rid: 12, ok: true, readBallot: Ballot(round: 2, id: 3), writeBallot: .zero,
+                          value: CoreState(generation: 4, tlogs: ["l:1#tlog-1"], startVersion: 100).bytes),
+            .registerWorker(rid: 13, WorkerRegistration(worker: "w:1#worker", processClass: .storage, roles: ["w:1#storage-1"],
+                                                        storage: StorageReport(endpoint: "w:1#storage-1", tag: 5, appliedVersion: 6))),
+            .recruit(rid: 14, .tlog(TLogSpec(generation: 2, startVersion: 9, seedFrom: ["l:1#tlog-a"], initialTags: [1]))),
+            .recruit(rid: 15, .proxy(ProxySpec(generation: 2, index: 1, startVersion: 9, master: "m", resolvers: ["r"], tlogs: ["t"],
+                                               clusterController: "cc", shardMap: map, writeSnapshot: true))),
+            .recoveryComplete(rid: 16, RecoveryResult(recoveryID: 1, generation: 2, master: "m", proxies: ["p"], resolvers: ["r"],
+                                                      tlogs: ["t"], shardMap: map, startVersion: 9)),
+            .resolve(rid: 17, ResolveRequest(generation: 2, proxyIndex: 0, version: 10, prevVersion: 9, lastSeenVersion: 8,
+                                             txns: [ResolveTxn(readVersion: 5, readKeys: [[1]], readRanges: [], writeKeys: [[2]])],
+                                             metaOps: [.transfer(moveID: 1, slots: SlotSet([3]), from: 0, to: 1)])),
+            .resolveReply(rid: 18, ResolveReply(verdicts: [0, 1, 2], stateOps: [StateOps(version: 9, ops: [.removeShard(shard: 4)])])),
+            .tlogPush(rid: 19, TLogPush(generation: 2, prevVersion: 9, entry: entry, knownCommitted: 8)),
+            .tlogPeekReply(rid: 20, PeekReply(status: .ok, entries: [PeekEntry(version: 10, mutations: [(0, .clear(key: [1]))], meta: [])], end: 10)),
+            .tlogLockReply(rid: 21, LockReply(known: true, generation: 2, durableVersion: 10, knownCommitted: 9)),
+            .tlogFetchReply(rid: 22, FetchReply(ok: true, entries: [entry], popped: [(1, 5), (metadataTag, 0)])),
+            .snapshotChunk(rid: 23, SnapshotChunk(version: 5, items: [.init(key: [1], versions: [VersionedValue(stamp: .zero, value: nil, expiresAt: 3)])], done: true)),
+            .reportCommitted(rid: 24, version: 10),
+            .halt(role: "x:1#proxy-2"),
         ]
         for m in messages {
             #expect(try Message.decode(m.encode()) == m, "\(m.name)")
@@ -67,6 +87,28 @@ import Testing
     @Test func rejectsGarbage() {
         #expect(throws: (any Error).self) { try Message.decode([200, 1, 2]) }
         #expect(throws: (any Error).self) { try Message.decode([3, 1]) }
+    }
+
+    @Test func idempotencyRecords() {
+        let v = SystemKeys.idempotencyValue(stamp: Versionstamp(version: 12, order: 3), attemptID: 99)
+        let parsed = SystemKeys.parseIdempotencyValue(v)
+        #expect(parsed?.stamp == Versionstamp(version: 12, order: 3) && parsed?.attemptID == 99)
+    }
+}
+
+@Suite struct ShardMapTests {
+    @Test func routingFollowsMetadata() {
+        var m = ShardMap()
+        m.apply(.createShard(shard: 0, members: [ShardMember(tag: 1, endpoint: "a", active: true), ShardMember(tag: 2, endpoint: "b", active: true)], slots: .all), at: 10)
+        #expect(m.tags(forSlot: 5) == [1, 2])
+        m.apply(.createShard(shard: 1, members: [ShardMember(tag: 3, endpoint: "c", active: true)], slots: SlotSet()), at: 11)
+        m.apply(.beginMigration(moveID: 1, slots: SlotSet([5]), from: 0, to: 1, sources: ["a"]), at: 12)
+        #expect(m.tags(forSlot: 5) == [1, 2, 3], "dual writes during migration")
+        m.apply(.transfer(moveID: 1, slots: SlotSet([5]), from: 0, to: 1), at: 13)
+        #expect(m.tags(forSlot: 5) == [3] && m.migration == nil)
+        m.apply(.removeReplica(shard: 0, tag: 2), at: 14)
+        #expect(m.tags(forSlot: 6) == [1])
+        #expect(m.nextTag == 4 && m.nextShardID == 2)
     }
 }
 
@@ -114,7 +156,7 @@ import Testing
 
 @Suite struct ResolverTests {
     @Test func pointAndRangeConflicts() {
-        var r = Resolver()
+        var r = ConflictSet()
         let w = CommitRequest(readVersion: 0, writeConflictKeys: [Bytes("a".utf8)], mutations: [])
         #expect(r.resolve(w, commitVersion: 10) == .commit)
         #expect(r.resolve(CommitRequest(readVersion: 5, readConflictKeys: [Bytes("a".utf8)]), commitVersion: 11) == .conflict)

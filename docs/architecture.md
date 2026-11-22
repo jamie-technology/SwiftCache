@@ -1,166 +1,182 @@
 # Architecture
 
-SwiftCache has two kinds of server process plus a client library.
+SwiftCache follows FoundationDB's architecture: a small coordinator quorum holds the root
+of authority, an elected **cluster controller** manages the cluster, and a **transaction
+system** made of separate roles (master, commit proxies, resolver, transaction logs)
+commits transactions that **storage servers** then pull and serve. The transaction system
+runs in *generations*. When any of its roles fails, the cluster doesn't repair it in place:
+it recovers into a new generation, fencing the old one.
 
 ```
-            ┌──────────────────────────── clients (SwiftCache library) ────────────────────────────┐
-            │  getReadVersion / commit / topology                       read / readRange           │
-            ▼                                                                   ▼                   │
-   ┌─────────────────┐   ordered batch stream (per server)    ┌────────────┐ ┌────────────┐ ┌────────────┐
-   │   Coordinator   │ ─────────────────────────────────────▶ │ storage-0  │ │ storage-2  │ │ storage-4  │
-   │ sequencer       │ ◀───────────────── batchAck ────────── │ storage-1  │ │ storage-3  │ │ storage-5  │
-   │ resolver        │                                        │  shard 0   │ │  shard 1   │ │  shard 2   │
-   │ cluster control │                                        └────────────┘ └────────────┘ └────────────┘
-   └─────────────────┘                                           snapshot copies between storage servers
+     ┌──────── coordinators (3 or 5; quorum; durable) ────────┐
+     │ leader election (leases)  ·  generation register (Paxos)│
+     └───────────────┬──────────────────────────┬──────────────┘
+          elects     │                          │ read / write CoreState (fence)
+                     ▼                          │
+            ┌──────────────────┐   recruits     │
+            │ cluster controller│──────────────▶ master (one per generation; sequencer)
+            │ workers · failure │                 │ versions
+            │ detection · data  │                 ▼
+            │ distribution      │◀─ meta commits─ commit proxies ──resolve──▶ resolver
+            └──────────────────┘                  │ push every version
+                                                  ▼
+                                   transaction logs (all of a generation; a commit is on every one)
+                                                  │ storage servers pull their tag, pop when applied
+                                                  ▼
+                          storage servers (shards × replicas; MVCC; serve reads directly to clients)
 ```
 
-## Design principle: one codebase, two runtimes
+## Roles, authority and fencing
 
-Every server process is a `ServerNode`: a single-threaded state machine that reacts to
-messages and timers and interacts with the world only through `NodeEnvironment`:
+| Role | Count | Authority | Fenced by | State |
+| --- | --- | --- | --- | --- |
+| **Coordinator** | 3 or 5 (configured) | Elects the controller; stores `CoreState` (current generation and its logs) in a single-decree Paxos register | Ballots: a coordinator never accepts a write below a ballot it has promised | Register persisted to disk (fsync) |
+| **Cluster controller** | 1, elected | Worker registry, failure detection, recruiting masters, data distribution, publishing cluster info | Its lease. It steps down before coordinators can elect another. The hard fence is that it can only change things through a generation, and old generations are locked | Rebuilt from worker registrations and the recovered shard map |
+| **Master** | 1 per generation | Runs recovery, then allocates commit versions and tracks the committed version | Must write `CoreState` with its ballot before the generation goes live. A newer recovery's promise makes that write fail | In memory |
+| **Commit proxy** | N per generation | Batches commits, routes mutations to logs, writes idempotency records, serves read versions | Pushes go to logs that refuse once locked. Read versions require every log to confirm it's unlocked | Transient |
+| **Resolver** | 1 per generation | Decides conflicts in version order. Relays metadata changes between proxies | Rejects read versions from before its generation started | Per generation |
+| **Transaction log** | L per generation | Durability: a version is committed when *every* log of the generation has it | Locked by the next recovery | In memory |
+| **Storage server** | shards × replicas | Holds data and serves multi-version reads | Only ever applies versions the logs report as committed | In memory |
 
-```swift
-public protocol NodeEnvironment: AnyObject {
-    var now: UInt64 { get }                       // monotonic µs
-    var versionClock: UInt64 { get }              // wall-clock µs (seeds commit versions)
-    func send(_ message: Message, to endpoint: Endpoint)
-    func schedule(after micros: UInt64, _ action: @escaping () -> Void)
-    func random(_ upperBound: UInt64) -> UInt64
-    func log(_ level: LogLevel, _ message: @autoclosure () -> String)
-}
-```
+Every role is its own state machine with its own lifecycle. A *process* (one
+`swiftcache-server`) hosts any number of roles, and which roles share a process is a
+deployment decision. Process classes say what the cluster may recruit where: `stateless`
+(controller candidate, master, proxies, resolvers), `log` (transaction logs), `storage`
+(one storage server). Any process can additionally be a coordinator.
 
-- **Production** (`SwiftCacheNet.NodeHost`) runs each node on one SwiftNIO event loop: TCP,
-  real clocks and system randomness.
-- **Simulation** (`SwiftCacheSim.Simulator`) runs every node of a cluster on one thread with a
-  virtual clock, a seeded RNG and a simulated network with faults.
+Role endpoints look like `host:port#proxy-3f2a…`. The id is fresh for every incarnation,
+so a message to a role that no longer exists gets a definitive "no such role" reply from
+its process. Recovery uses this to tell a dead log (safe to give up on) from an
+unreachable one (must wait).
 
-The client is written against `ClientTransport` and runs in both worlds too. In simulation its
-async tasks run on a custom deterministic `TaskExecutor`. See [simulation.md](simulation.md).
+## The commit path
 
-## Data model
+1. A client gets a **read version** from any proxy of the current generation. The proxy asks
+   the master for the committed version *and* confirms with every log that the generation
+   is unlocked. A proxy of a superseded generation can never hand out a stale read version.
+2. The client reads directly from storage replicas at that version, buffering writes locally.
+3. The client sends the commit (read version, read/write conflict ranges, mutations,
+   optional idempotency id) to any proxy.
+4. The proxy batches commits (every 1 ms) and asks the master for `(prevVersion, version)`.
+   Versions follow the wall clock in µs and never go backwards.
+5. The proxy sends the batch's conflict ranges to the resolver. The resolver decides each
+   transaction in version order, so later transactions in a batch see earlier ones. It also
+   returns any metadata other proxies committed in between, so every proxy routes
+   identically.
+6. The proxy tags each mutation with the tags of the storage servers that own its slot (both
+   owners during a migration). It then pushes the version to **every** log. Logs append
+   strictly in `prevVersion` order.
+7. Once every log has acknowledged, the proxy reports the version to the master, waits for
+   its acknowledgement, and only then replies to clients. Any read version handed out after
+   a client hears "committed" therefore includes that commit.
+8. Storage servers long-poll ("peek") their tag from a log. Logs only expose versions known
+   to be on every log, so storage never applies anything that recovery could discard.
+   Storage pops what it has applied.
 
-- Keys and values are byte strings. The client encodes `String` as UTF-8, `[UInt8]`/`Data` raw,
-  and any other `Codable` as JSON.
-- **Versions** are `UInt64` commit versions assigned by the coordinator. They advance at about
-  1,000,000 per second (they follow the wall clock in microseconds), so a version difference
-  reads as elapsed time.
-- **Versionstamps** are `(version, order)`: 8 + 2 bytes, totally ordered. `order` distinguishes
-  transactions committed in the same batch.
-- **MVCC.** Storage servers keep every version of a key written within the MVCC window
-  (default 10s), so reads at any version in the window are exact.
+A commit has two possible outcomes per transaction: committed with versionstamp
+`(version, order)`, or failed (`not_committed`, `transaction_too_old`, `unavailable`). If
+the client hears nothing, the outcome is unknown; see [idempotency](transactions.md#idempotency).
 
-## The coordinator
+## Recovery (starting a generation)
 
-The coordinator combines the roles FoundationDB spreads across master, proxies, resolvers and
-the cluster controller:
+The controller recruits a master whenever it takes office or a role of the current
+generation fails (detected through missed worker registrations). It also recruits one when
+redundancy can be restored, for example 3 logs again after running on 2. The master then:
 
-1. **Read versions.** `getReadVersion` returns the latest *committed* version: the highest
-   version that every active replica of every shard has applied.
-2. **Commit pipeline.** Every `batchInterval` (1ms) the coordinator takes the pending commit
-   requests and:
-   - assigns the batch a version `max(prev + 1, wall clock µs)`;
-   - resolves each transaction in arrival order against the resolver's write history (see
-     [transactions.md](transactions.md)), so later transactions in the batch see earlier ones;
-   - gives each committed transaction a versionstamp `(version, i)`;
-   - sends **every** storage server a batch for this version containing only the mutations for
-     slots it stores. Empty batches still go out; they advance versions and carry the
-     committed version. Up to 16 batches can be in flight.
-3. **Acknowledgement.** A batch is committed once every *active* replica has acknowledged it.
-   Only then are its clients told "committed", in version order.
-4. **Cluster control.** Membership, failure detection, re-replication, shard formation and slot
-   rebalancing (below).
+1. **Reads `CoreState`** from a coordinator majority with a fresh ballot. This returns the
+   current generation and its logs, and promises that coordinators won't accept writes from
+   older ballots.
+2. **Locks the old generation's logs.** A commit needs every log, so locking any one stops
+   the old generation. Every acknowledged commit is on every log. The **recovery version**
+   is therefore the minimum durable version among the locked logs: everything at or below it
+   is on all of them, and nothing above it was acknowledged.
+   - Logs that are unreachable but might be alive: wait for them, or proceed if at least one
+     log answered.
+   - Every old log definitively gone (all restarted): unapplied commits are lost (in-memory,
+     like losing every replica of a shard). The cluster continues from what storage has
+     applied.
+3. **Rebuilds the shard map** from the metadata tag of a locked log, and **recruits new
+   logs** seeded with the old logs' unreleased data (everything ≤ the recovery version that
+   storage hasn't popped yet), plus a resolver.
+4. **Writes `CoreState`** (new generation, new logs) with the same ballot. If a newer
+   recovery started meanwhile, a coordinator majority promised a higher ballot and the write
+   fails: this master is fenced and stops. At most one master can ever complete a given
+   generation.
+5. **Recruits commit proxies** and tells the controller the generation is live. The
+   controller publishes the new roles to every process and halts leftovers.
+
+The first new version is above every version any old log ever saw, so versionstamps are
+never reused. Storage servers aren't touched by recovery: they switch to the new logs and
+continue from the version they had applied. The resolver's conflict history starts fresh,
+so transactions whose read version predates the generation fail with
+`transaction_too_old` and retry.
+
+**Liveness backstop.** A master that sees versions handed out but nothing committing for
+`recoveryTimeout` ends its generation, and the controller recovers. Whatever wedged the
+pipeline, the cluster can't get stuck.
+
+## Leader election
+
+Every stateless process runs a candidate. Coordinators each nominate the best recent
+candidate and keep nominating it while it heartbeats (a lease of `leaseTimeout`). A
+candidate nominated by a majority becomes controller. The leader measures its lease from
+when it **sent** each heartbeat, so its view never outlives the coordinators'. It steps
+down (halting the controller role) after `leaderStepDownTimeout` without a majority, which
+is well before any coordinator would nominate someone else. A restarted coordinator
+abstains for one lease period, since it may have nominated someone before it crashed.
+
+Election is a liveness mechanism. Safety doesn't depend on it: even if two controllers
+briefly coexisted, only one could get a master through the generation register, and the
+other's generation would be locked.
+
+**Without a coordinator quorum**, no controller can be elected and no generation can form.
+The *running* generation keeps committing, because it doesn't need coordinators, until one
+of its roles fails.
+
+## Sharding and data distribution
+
+- 16,384 hash slots, `slot = CRC16(key) mod 16384` (Redis Cluster's function, with
+  `{hash tag}` support). Each slot is owned by one shard, and each shard has
+  `replication` replicas.
+- Each storage replica has a **tag**, its identity in the mutation stream. A restarted
+  storage process is a new incarnation, with a new endpoint and eventually a new tag.
+- The **shard map** (shards, members by tag, slot owners, migration in progress) changes
+  only through **metadata operations** that the controller commits through a proxy, like
+  any transaction. They are therefore ordered with all data writes, seen by every proxy at
+  the same version (relayed by the resolver), delivered to the affected storage servers in
+  their tag's stream, and recorded on a metadata tag that recovery replays. A shard-map
+  snapshot is written at the start of each generation.
+
+The controller's data distribution loop, one change at a time:
+
+| Situation | Metadata op(s) |
+| --- | --- |
+| No shards yet and ≥ `replication` idle storage servers | `createShard` with all slots |
+| Shard below `replication` and an idle server is available | `addReplica`: the new replica copies the shard from an active member, then `replicaReady` |
+| ≥ `replication` idle servers | `createShard` (empty), then rebalancing fills it |
+| Slot counts differ by more than 1 | `beginMigration` (dual writes; destination copies a snapshot), then `transfer` once every destination replica is ready |
+| Replica gone (dead, restarted or wiped) for `failureTimeout` | `removeReplica`; for the *last* replica, wait `shardLossTimeout` first |
+| Last replica of a shard removed | `reassignSlots` (empty) to the smallest shard, then `removeShard` (data loss, logged) |
+
+Copying a snapshot: the destination buffers its tag's mutations for the moving slots,
+fetches every MVCC version of those slots from a source replica (at a version ≥ the op's
+version), installs them, replays buffered mutations newer than the snapshot, and skips
+stream mutations the snapshot already contained. Destinations receive the full version
+history, so historical reads keep working across migrations.
 
 ## Storage servers
 
-A storage server is one replica of one shard. It:
-
-- applies batches strictly in version order, checking that each batch's `prevVersion` equals
-  the last version it applied;
-- serves `read` and `readRange` at a requested version, waiting until it has applied that
-  version **and** knows it is committed. A lagging or partitioned replica therefore never
-  returns stale data; at worst the client times out and tries another replica;
-- garbage-collects versions older than the window, keeping the newest version at or below the
-  horizon;
-- copies data to new replicas and new shard owners (snapshot transfer);
-- reports itself to the coordinator (`join`) when it starts or loses contact.
-
-The store (`VersionedStore`) holds a hash map from key to an ascending version list, plus a
-sorted key index (chunked sorted arrays) for range scans. TTL expiry is version-based: a value
-written at `v` with `ttl` is invisible to reads at versions ≥ `v + ttl`.
-
-## Sharding
-
-- 16,384 hash slots. `slot = CRC16(key) mod 16384`, the same function as Redis Cluster,
-  including `{hash tag}` support for co-locating related keys.
-- Each slot is owned by one shard; each shard has `replication` replicas.
-- **Forming shards.** New storage servers join an unassigned pool. When `replication` of them
-  are available (after under-replicated shards have been topped up), they form a new empty
-  shard.
-- **Rebalancing.** The coordinator moves chunks of slots (2,048 at a time) from the largest
-  shard to the smallest until slot counts differ by at most one. One data movement runs at a
-  time.
-
-### Moving slots (and catching up replicas)
-
-Both use the same mechanism:
-
-1. At batch version `Vb` the coordinator sends `beginReceive(slots, sources)` to the
-   destination servers. From the *next* batch on, mutations for those slots go to both the old
-   owner and the destination ("dual write"). The destination buffers them.
-2. Each destination asks a source replica for a snapshot of those slots at a version ≥ `Vb`.
-   The source sends **every** MVCC version it holds for them, tagged with its applied version
-   `Va`.
-3. The destination installs the snapshot, replays buffered mutations newer than `Va`, skips any
-   later batch mutations at or below `Va`, and reports `moveReady`.
-4. When every active destination replica is ready, the coordinator sends
-   `transfer(slots, from, to)` in the batch stream. The old owner drops the data, the new owner
-   starts serving, and clients pick up the new topology on their next `wrong_shard` error.
-
-The destination has the full version history, so historical reads keep working across a
-migration. Range reads check that the slot sets returned by every shard cover all 16,384 slots
-exactly once, and retry otherwise.
-
-## Failure handling
-
-| Failure | Behaviour |
-| --- | --- |
-| Storage replica crashes | After `failureTimeout` without acknowledging a batch it owes, it is marked failed and dropped from the commit quorum. When the pod restarts it rejoins empty and catches up from a peer by snapshot. |
-| Broken connection / short partition | The coordinator keeps each server's unacknowledged batches. A server that sees a gap asks for a resend and continues without losing data. |
-| Last live replica of a shard stops responding | It is **not** dropped on the short timeout: commits stall rather than risk throwing away the shard's only copy. After `shardLossTimeout` (default 60s; 120s in the k8s args) the shard is declared lost, its slots are reassigned empty, and the error is logged. |
-| Every replica of a shard really dies | The shard's data is lost, as with Redis without persistence. The cluster stays up. |
-| Coordinator crashes | See below. |
-
-### Coordinator recovery
-
-The coordinator keeps no disk state; it rebuilds everything from storage servers.
-
-1. On start it waits `recoveryWindow` for `join` reports from storage servers. Each report
-   carries the server's shard, applied version, known-committed version and owned slots.
-2. It picks a new epoch (higher than any reported) and computes the truncation point
-   `Vr = min over shards (max applied among that shard's active replicas)`. Every version ≤ `Vr`
-   is fully present in at least one replica of every shard. Every version acknowledged to a
-   client is ≤ `Vr`, because acknowledged means every active replica applied it.
-3. It sends `recover(epoch, Vr)`. Replicas at or ahead of `Vr` truncate to exactly `Vr`, rolling
-   back unacknowledged partial batches; MVCC makes this a simple trim. Lagging replicas are
-   wiped and later re-synced from a peer.
-4. It finishes only once every shard has a replica confirmed at `Vr`. If replies are lost it
-   resends `recover`, and if a shard never confirms it restarts recovery rather than declare the
-   data lost.
-5. The resolver's history is gone, so commits whose read version predates recovery fail with
-   `transaction_too_old`, and clients retry. Historical *reads* still work, because storage
-   keeps its history.
-
-Writes are unavailable for about `recoveryWindow` plus a little; reads at already-known versions
-keep working throughout.
-
-Shards whose best replica is behind the highest known-committed version are treated as lost,
-not used to roll the cluster back.
+- Apply their tag's stream strictly in version order. Reads at version `v` wait until `v`
+  is applied (`future_version` after `readWaitTimeout`).
+- Keep every version of each key within the MVCC window, and GC older ones (keeping the
+  newest at or below the horizon). TTLs are version-based.
+- A storage server that falls behind catches up from the logs, which keep its tag's data
+  until it pops it. If the logs no longer have its position, or its tag was retired, it
+  wipes itself and returns to the idle pool to be re-added.
 
 ## Wire protocol
 
-Length-prefixed (4-byte big-endian) frames over TCP. The first frame on a connection is
-`hello(endpoint)`; every later frame is a binary-encoded `Message` (see
-`SwiftCacheCore/Message.swift`). Servers always dial each other, one connection per destination,
-so message order per link is preserved, matching the simulator's network model. Replies to
-clients go back over the client's own connection.
+Length-prefixed (4-byte big-endian) frames over TCP, each carrying `from`, `to` and a
+binary-encoded `Message`. Processes always dial each other, one connection per
+destination process, so per-link message order is preserved, matching the simulator's
+network model. Replies to clients go back over the client's own connection.

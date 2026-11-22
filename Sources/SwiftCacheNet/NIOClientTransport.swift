@@ -39,20 +39,16 @@ public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
             guard let (host, port) = parseEndpoint(ep) else {
                 return group.next().makeFailedFuture(TransportError.connectionFailed(ep, "bad endpoint"))
             }
-            let me = clientEndpoint
             let f = ClientBootstrap(group: group)
                 .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
                 .connectTimeout(.seconds(2))
                 .channelInitializer { [weak self] channel in
                     installFramePipeline(channel, onFrame: { _, frame in
-                        guard case .message(let m) = frame, let rid = m.rid else { return }
-                        self?.complete(rid, .success(m))
+                        guard let rid = frame.message.rid else { return }
+                        self?.complete(rid, .success(frame.message))
                     }, onClose: { _ in self?.connectionClosed(ep) })
                 }
                 .connect(host: host, port: port)
-                .flatMap { ch in
-                    ch.writeAndFlush(encodeFrame(.hello(me), allocator: ch.allocator)).map { ch }
-                }
             f.whenFailure { [weak self] _ in self?.connectionClosed(ep) }
             connections[ep] = f
             return f
@@ -62,7 +58,7 @@ public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
     private func connectionClosed(_ ep: Endpoint) {
         let failed: [CheckedContinuation<Message, any Error>] = lock.withLock {
             connections[ep] = nil
-            let rids = pending.filter { $0.value.endpoint == ep }.map(\.key)
+            let rids = pending.filter { $0.value.endpoint.processAddress == ep }.map(\.key)
             return rids.compactMap { pending.removeValue(forKey: $0)?.cont }
         }
         for c in failed { c.resume(throwing: TransportError.connectionFailed(ep, "connection closed")) }
@@ -81,13 +77,13 @@ public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
         let message = make(rid)
         let channel: any Channel
         do {
-            channel = try await connection(to: endpoint).get()
+            channel = try await connection(to: endpoint.processAddress).get()
         } catch {
             throw TransportError.connectionFailed(endpoint, "\(error)")
         }
         return try await withCheckedThrowingContinuation { cont in
             lock.withLock { pending[rid] = (endpoint, cont) }
-            channel.writeAndFlush(encodeFrame(.message(message), allocator: channel.allocator)).whenFailure { [weak self] err in
+            channel.writeAndFlush(encodeFrame(Frame(from: clientEndpoint, to: endpoint, message: message), allocator: channel.allocator)).whenFailure { [weak self] err in
                 self?.complete(rid, .failure(TransportError.connectionFailed(endpoint, "\(err)")))
             }
             channel.eventLoop.scheduleTask(in: .microseconds(Int64(timeout))) { [weak self] in

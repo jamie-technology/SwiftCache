@@ -15,8 +15,10 @@ struct SimCommand: ParsableCommand {
     @Option(help: "Storage servers added mid-run (scale-out).") var scaleOut: Int = 3
     @Option(help: "Client tasks.") var clients: Int = 10
     @Flag(help: "Disable fault injection.") var noChaos = false
-    @Flag(help: "Never crash the coordinator.") var noCoordinatorCrashes = false
+    @Flag(help: "Only storage faults (no faults in the transaction system).") var storageFaultsOnly = false
     @Flag(help: "Print every log line.") var verbose = false
+    @Option(help: "Run a targeted scenario instead of random chaos (or 'all'): \(Scenario.allCases.map(\.rawValue).joined(separator: ", ")).")
+    var scenario: String?
     @Flag(help: "Run each seed twice and verify identical traces.") var checkDeterminism = false
 
     func run() throws {
@@ -27,13 +29,23 @@ struct SimCommand: ParsableCommand {
         options.scaleOutServers = scaleOut
         options.clients = clients
         options.chaos = !noChaos
-        options.coordinatorCrashes = !noCoordinatorCrashes
+        options.transactionSystemFaults = !storageFaultsOnly
         options.verbose = verbose
         var failed = 0
+        let scenarios: [Scenario?]
+        if scenario == "all" { scenarios = Scenario.allCases } else if let name = scenario {
+            guard let sc = Scenario(rawValue: name) else { throw ValidationError("unknown scenario \(name)") }
+            scenarios = [sc]
+        } else { scenarios = [nil] }
+        var runs = 0
+        for sc in scenarios {
+        options.scenario = sc
+        if let sc { print("== scenario \(sc.rawValue)") }
         for s in seed..<(seed + UInt64(count)) {
+            runs += 1
             let r = runSimulation(seed: s, options: options)
             var line = "seed \(s): \(r.passed ? "PASS" : "FAIL") trace=\(String(r.traceHash, radix: 16)) msgs=\(r.messages)"
-            let interesting = ["bank.commits", "bank.audits", "cycle.commits", "cas.success", "cas.mismatch", "add.commits", "history.commits", "history.historicalReads"]
+            let interesting = ["recoveries", "bank.commits", "cycle.commits", "cas.success", "add.commits", "orders.commits", "history.commits", "history.historicalReads"]
             line += " " + interesting.map { "\($0)=\(r.stats[$0] ?? 0)" }.joined(separator: " ")
             if checkDeterminism {
                 let again = runSimulation(seed: s, options: options)
@@ -50,7 +62,8 @@ struct SimCommand: ParsableCommand {
                 for l in r.logTail.suffix(40) { print("  \(l)") }
             }
         }
-        print("\(count - failed)/\(count) seeds passed")
+        }
+        print("\(runs - failed)/\(runs) runs passed")
         if failed > 0 { throw ExitCode.failure }
     }
 }

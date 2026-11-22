@@ -1,8 +1,9 @@
 # SwiftCache
 
-SwiftCache is an in-memory, sharded, replicated key-value store written in Swift, with a
-FoundationDB-style transaction layer. Think Redis, but with serializable multi-key
-transactions, versionstamps, compare-and-swap on key versions, and historical reads.
+SwiftCache is an in-memory, sharded, replicated key-value store written in Swift, built on a
+FoundationDB-style distributed transaction system. Think Redis, but with serializable
+multi-key transactions, versionstamps, compare-and-swap on key versions, historical reads,
+and exactly-once idempotent commits.
 
 - **Serializable transactions** that retry automatically on read/write conflicts (optimistic
   concurrency, FoundationDB style).
@@ -15,6 +16,12 @@ transactions, versionstamps, compare-and-swap on key versions, and historical re
   grows with the cluster.
 - **Replication.** Each shard has N in-memory replicas. Failed replicas are detected and
   re-replicated automatically.
+- **Distributed, fenced transaction system.** A coordinator quorum elects a cluster
+  controller and holds the transaction system's root state in a Paxos register. Separate
+  master, commit-proxy, resolver and transaction-log roles run in *generations*; a failure
+  produces a new generation, and the old one is locked out.
+- **Idempotent transactions** (`idempotent: true`) are applied exactly once, even when a
+  commit's outcome is unknown and it gets retried.
 - **Deterministic simulation.** The server is written as message-driven state machines that run
   unchanged inside a seeded, single-threaded simulator with crashes, partitions and latency
   storms. The real Swift client library runs inside the simulation too.
@@ -23,7 +30,7 @@ transactions, versionstamps, compare-and-swap on key versions, and historical re
 ```swift
 import SwiftCache
 
-let db = try await Database.connect(coordinator: "swiftcache-coordinator.swiftcache.svc.cluster.local:7400")
+let db = try await Database.connect(cluster: "coord-0:4500,coord-1:4500,coord-2:4500")
 
 // Optimistic update on a key's version.
 let entry = try await db.getVersioned("users/123")!
@@ -56,9 +63,9 @@ let then = try await db.read(atVersion: v) { tr in try await tr.get("acct/alice"
 
 ```bash
 ./scripts/build-image.sh                        # builds swiftcache:<git-sha> into Docker (visible to colima/k3s)
-kubectl apply -f deploy/k8s/swiftcache.yaml     # 1 coordinator + 4 storage pods = 2 shards × 2 replicas
+kubectl apply -f deploy/k8s/swiftcache.yaml     # 3 coordinators, 3 logs, 4 storage = 2 shards × 2 replicas
 kubectl -n swiftcache run cli --rm -it --image=swiftcache:latest --restart=Never \
-  --env=SWIFTCACHE_COORDINATOR=swiftcache-coordinator.swiftcache.svc.cluster.local:7400 \
+  --env=SWIFTCACHE_CLUSTER="$(kubectl -n swiftcache get cm swiftcache-config -o jsonpath='{.data.CLUSTER}')" \
   --command -- swiftcache-cli status --stats
 
 kubectl -n swiftcache scale statefulset swiftcache-storage --replicas=6   # add a shard
@@ -72,6 +79,7 @@ kubectl -n swiftcache scale statefulset swiftcache-storage --replicas=6   # add 
 swift build
 swift test                                                   # unit tests + simulation seeds + determinism check
 swift run -c release swiftcache-sim --count 500              # 500 seeds of chaos simulation
+swift run -c release swiftcache-sim --scenario all --count 25   # targeted fault scenarios
 swift run -c release swiftcache-sim --seed 57 --verbose      # replay one seed, with full logs
 ```
 
@@ -79,23 +87,25 @@ swift run -c release swiftcache-sim --seed 57 --verbose      # replay one seed, 
 
 | Doc | Contents |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | Components, the commit pipeline, replication, sharding, recovery |
+| [docs/architecture.md](docs/architecture.md) | Roles and fencing, the commit path, recovery, leader election, sharding |
 | [docs/transactions.md](docs/transactions.md) | Transaction semantics, versionstamps, CAS, historical reads, conflicts, retries |
 | [docs/client.md](docs/client.md) | Swift client library API reference and patterns |
 | [docs/simulation.md](docs/simulation.md) | Deterministic simulation: how it works, workloads, reproducing failures |
 | [docs/operations.md](docs/operations.md) | Running on k3s: deployment, scaling, failure behaviour, tuning, CLI |
-| [docs/roadmap.md](docs/roadmap.md) | Known limitations and what's next (distributed coordinator, idempotency IDs, performance) |
+| [docs/roadmap.md](docs/roadmap.md) | Known limitations and what's next (performance vs Redis) |
 
 ## Layout
 
 ```
 Sources/
   SwiftCacheCore/     types, versionstamps, slots, binary wire protocol, ClientTransport protocol
-  SwiftCacheServer/   Coordinator, StorageServer, VersionedStore, Resolver (pure state machines, no I/O)
-  SwiftCacheSim/      deterministic simulator, workloads, invariant checkers
-  SwiftCacheNet/      SwiftNIO runtime: framing, NodeHost (runs a state machine on one event loop), client transport
+  SwiftCacheServer/   roles as pure state machines (no I/O): CoordinatorRole, CandidateRole,
+                      ClusterController, MasterRole, CommitProxy, ResolverRole, TLogRole,
+                      StorageServer, WorkerAgent; plus VersionedStore, ConflictSet, ProcessHost
+  SwiftCacheSim/      deterministic simulator, workloads, fault scenarios, invariant monitors
+  SwiftCacheNet/      SwiftNIO runtime: framing, NodeHost (runs a process's roles on one event loop), FileDisk, client transport
   SwiftCache/         the client library (Database, Transaction)
-  swiftcache-server/  server binary (coordinator | storage)
+  swiftcache-server/  server binary (--class stateless | log | storage [--coordinator])
   swiftcache-cli/     CLI: get/set/cas/range/status, verify (end-to-end suite), bench
   swiftcache-sim/     simulation runner
 deploy/k8s/           k3s manifests

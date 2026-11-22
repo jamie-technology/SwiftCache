@@ -1,25 +1,26 @@
 import NIOCore
 import SwiftCacheCore
 
-/// Wire framing: every frame is a 4-byte big-endian length followed by the payload.
-/// A payload starting with 0xFF is a `hello` carrying the sender's endpoint (sent once
-/// per connection); anything else is an encoded `Message`.
-public enum Frame {
-    case hello(Endpoint)
-    case message(Message)
+/// Wire framing: every frame is a 4-byte big-endian length followed by
+/// `from` (string), `to` (string) and an encoded `Message`. Routing on `to` lets one
+/// connection serve every role a process hosts.
+public struct Frame: Sendable {
+    public var from: Endpoint
+    public var to: Endpoint
+    public var message: Message
+    public init(from: Endpoint, to: Endpoint, message: Message) { self.from = from; self.to = to; self.message = message }
 }
 
 public let maxFrameSize = 64 << 20
 
 public func encodeFrame(_ frame: Frame, allocator: ByteBufferAllocator) -> ByteBuffer {
-    let payload: Bytes
-    switch frame {
-    case .hello(let ep): payload = [0xFF] + Bytes(ep.utf8)
-    case .message(let m): payload = m.encode()
-    }
-    var buf = allocator.buffer(capacity: payload.count + 4)
-    buf.writeInteger(UInt32(payload.count))
-    buf.writeBytes(payload)
+    var w = WireWriter(capacity: 128)
+    w.string(frame.from)
+    w.string(frame.to)
+    frame.message.encode(to: &w)
+    var buf = allocator.buffer(capacity: w.bytes.count + 4)
+    buf.writeInteger(UInt32(w.bytes.count))
+    buf.writeBytes(w.bytes)
     return buf
 }
 
@@ -31,14 +32,11 @@ struct FrameDecoder: ByteToMessageDecoder {
         guard Int(length) <= maxFrameSize else { throw WireError("frame too large: \(length)") }
         guard buffer.readableBytes >= 4 + Int(length) else { return .needMoreData }
         buffer.moveReaderIndex(forwardBy: 4)
-        let bytes = buffer.readBytes(length: Int(length))!
-        let frame: Frame
-        if bytes.first == 0xFF {
-            frame = .hello(String(decoding: bytes.dropFirst(), as: UTF8.self))
-        } else {
-            frame = .message(try Message.decode(bytes))
-        }
-        context.fireChannelRead(wrapInboundOut(frame))
+        var r = WireReader(buffer.readBytes(length: Int(length))!)
+        let from = try r.string()
+        let to = try r.string()
+        let message = try Message.decode(from: &r)
+        context.fireChannelRead(wrapInboundOut(Frame(from: from, to: to, message: message)))
         return .continue
     }
 }
@@ -80,8 +78,9 @@ func installFramePipeline(_ channel: any Channel, onFrame: @escaping (any Channe
     }
 }
 
-/// Splits `host:port`.
+/// Splits `host:port` (ignoring any `#role` suffix).
 public func parseEndpoint(_ ep: Endpoint) -> (host: String, port: Int)? {
-    guard let idx = ep.lastIndex(of: ":"), let port = Int(ep[ep.index(after: idx)...]) else { return nil }
-    return (String(ep[..<idx]), port)
+    let address = ep.processAddress
+    guard let idx = address.lastIndex(of: ":"), let port = Int(address[address.index(after: idx)...]) else { return nil }
+    return (String(address[..<idx]), port)
 }

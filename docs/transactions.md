@@ -5,12 +5,12 @@
 SwiftCache transactions are **strictly serializable**, using optimistic concurrency control in
 the style of FoundationDB:
 
-1. **Read version.** The first read fetches the latest committed version `R` from the
-   coordinator. Every read in the transaction sees the database exactly as of `R`.
+1. **Read version.** The first read fetches the latest committed version `R` from a commit
+   proxy. Every read in the transaction sees the database exactly as of `R`.
 2. **Buffered writes.** `set`, `clear` and `add` are buffered in the client. Later reads in the
    same transaction see them (read-your-writes).
 3. **Commit.** The client sends its read version, read-conflict keys and ranges, write keys and
-   mutations to the coordinator. The resolver checks whether any transaction that committed
+   mutations to a commit proxy. The resolver checks whether any transaction that committed
    *after* `R` wrote a key or range this transaction read:
    - if not, the transaction commits at version `C > R` and gets the versionstamp `(C, order)`;
    - if so, it fails with `notCommitted` and nothing is written.
@@ -165,16 +165,61 @@ can still commit.
 | Error | Retried by `transaction`? | Meaning |
 | --- | --- | --- |
 | `notCommitted` | yes | conflict |
-| `transactionTooOld` | yes (no, for pinned versions) | read version left the MVCC window, or predates a coordinator recovery |
+| `transactionTooOld` | yes (no, for pinned versions) | read version left the MVCC window, or predates the current transaction-system generation |
 | `futureVersion` | yes | replicas hadn't caught up in time |
 | `unavailable` | yes | recovery, no shards yet, a shard without live replicas, or a stale topology |
-| `commitUnknownResult` | yes, except `db.add` | the commit was sent but no reply arrived |
+| `commitUnknownResult` | yes (exactly-once if `idempotent: true`) | the commit was sent but no reply arrived |
 | `versionMismatch` | no | CAS precondition failed |
 | `tooLarge` | no | key > 10KB, value > 1MB or transaction > 10MB |
 
-**`commitUnknownResult` and idempotency.** As in FoundationDB, a commit whose reply is lost (for
-example, the coordinator crashes mid-commit) may or may not have applied, and the retry loop
-runs it again. Transactions that read before writing are naturally safe: the retry sees its own
-earlier effect, and CAS-style logic notices. Blind non-idempotent writes (`add`) are not, so
-`db.add` surfaces the error instead of retrying. Automatic idempotency IDs are on the
-[roadmap](roadmap.md).
+## Idempotency
+
+Commits are atomic: a transaction is never partially applied. But a commit whose reply is
+lost (a proxy crashes, a connection drops) has an **unknown outcome**: it either fully
+committed or didn't commit at all, and the client can't tell which. As in FoundationDB, the
+retry loop retries `commitUnknownResult` by default, so a transaction body that isn't
+idempotent can be applied twice:
+
+```swift
+// Not idempotent: each attempt generates a new id. If attempt 1 commits but its reply is
+// lost, attempt 2 creates a second order.
+try await db.transaction { tr in
+    let id = UUID().uuidString
+    try tr.set("orders/\(id)", order)
+    tr.add("orders/count", 1)
+}
+```
+
+Read-then-write transactions are usually naturally safe: the retry sees the first attempt's
+effect. Blind writes, counters and freshly generated ids are not.
+
+**`idempotent: true`** makes an operation apply exactly once:
+
+```swift
+let id = try await db.transaction(idempotent: true) { tr -> String in
+    let id = UUID().uuidString
+    try tr.set("orders/\(id)", order)
+    tr.add("orders/count", 1)
+    return id
+}
+```
+
+How it works:
+
+- The logical operation gets a 16-byte **operation id**, stable across retries. Each attempt
+  also gets an **attempt id**.
+- The commit proxy writes `\xff/idmp/<operation id>` = (versionstamp, attempt id)
+  **atomically with the commit**. Every attempt both reads (for conflict purposes) and writes
+  that key, so two attempts can never both commit: whichever commits second conflicts.
+- After an unknown result, the next attempt first reads the record. If an earlier attempt
+  committed, it returns **that attempt's** result and versionstamp (`uuid-A` in the example,
+  not a fresh `uuid-B`) without running the body again.
+- Records expire after `DatabaseOptions.idempotencyRetention` (10 minutes by default),
+  which bounds how long after an unknown result a retry can still be deduplicated.
+
+Cost: one small extra write per idempotent commit, plus one point read on a retry after an
+unknown result. The single-key conveniences (`set`, `clear`, `add`, `compareAndSwap`,
+`compareAndDelete`) are always idempotent. `transaction` is opt-in, as in FoundationDB
+(whose 7.1+ `automatic_idempotency` option works the same way).
+
+Keys beginning with `0xFF` are reserved for the system.

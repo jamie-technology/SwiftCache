@@ -1,68 +1,58 @@
 # Roadmap and known limitations
 
-## Milestone 1 (current)
+## Done
 
-A single coordinator, sharded and replicated in-memory storage, serializable transactions,
-versionstamps, CAS, historical reads, deterministic simulation, a SwiftNIO runtime and k3s
-deployment.
+- **Milestone 1:** sharded, replicated in-memory storage; serializable transactions;
+  versionstamps; CAS; historical reads; deterministic simulation; SwiftNIO runtime; k3s.
+- **Milestone 2:** FoundationDB-style distributed transaction system: coordinator quorum
+  with leader election and a Paxos generation register; elected cluster controller; master
+  (sequencer); commit proxies; resolver; replicated transaction logs that storage servers
+  pull from; generation-based recovery with fencing; data distribution through metadata
+  commits; exactly-once idempotent transactions; targeted fault scenarios.
 
-### Known limitations
+## Next: performance (vs Redis)
 
-- **The coordinator is a single process** that combines sequencer, resolver, commit proxy and
-  cluster controller. It recovers from storage reports after a crash, but writes are unavailable
-  until a replacement pod is up, and every commit passes through one event loop.
-- **No durable log.** An acknowledged commit lives only in storage replicas' memory. Losing every
-  replica of a shard loses that shard's data.
-- **Unknown commit results** can double-apply non-idempotent transactions on retry.
-- **No scale-down.** Removing shards (draining slots off a shard) isn't implemented.
-- **No eviction.** Memory is bounded only by the pod limit. There is no LRU or max-memory policy.
-- **No auth or TLS** on the wire protocol.
-- **Clients need pod-network access** (they route directly to storage pods).
-- **Range reads** scatter to every shard (hash partitioning).
+Target: Redis-class single-key throughput and latency, measured side by side in the same
+k3s cluster (`redis-benchmark` against Redis 7 vs. an equivalent SwiftCache harness with
+matching key and value sizes and connection counts). Report GET/SET ops/s and
+p50/p99/p999, plus transactional workloads (bank transfers vs Redis `WATCH`/`MULTI`).
 
-## Next: distributed, role-split transaction system (FoundationDB-style)
+Current laptop baseline (k3s on colima, 4 vCPU): ~7k ops/s at 80% reads, p50 4 ms, p99 12 ms.
+Every single-key operation is currently a full transaction. Likely work, roughly in order
+of payoff:
 
-Separate authority and failure domains first, and processes only where that adds resilience.
+- **Read versions:** batch GRV requests per proxy and confirm generation liveness once per
+  batch (FoundationDB does this); let clients reuse a recent read version for read-only
+  single-key gets (bounded staleness, opt-in) or use causal read-your-writes tokens.
+- **Commit path:** pipeline the master's committed-version acknowledgement instead of
+  waiting per batch; tune batching for latency versus throughput.
+- **Zero-copy encoding:** `ByteBuffer` end to end instead of `[UInt8]` copies.
+- **Storage:** multiple storage servers per process (one per core); a per-tag index in the
+  logs (peek currently scans entries).
+- **Clients:** connection pooling and request pipelining.
 
-- **Coordinators (Paxos/quorum, 3 or 5).** Store only the cluster's generation and configuration,
-  and elect a single **cluster controller**. They replace "the" coordinator as the source of
-  truth for "who is in charge", so a partitioned controller is fenced by generation number.
-- **Cluster controller.** Membership, failure detection (by quorum rather than one observer),
-  and recruiting the roles below.
-- **Sequencer.** Hands out commit versions and read versions. Small and fast.
-- **Commit proxies (N).** Accept commits, batch them, get a version from the sequencer, send
-  conflict ranges to resolvers and mutations to the log. Clients spread over proxies.
-  - **Idempotency IDs.** Each commit carries a client-generated ID that is written into the log
-    alongside its mutations. After `commitUnknownResult`, the client (or a proxy after recovery)
-    can ask whether that ID committed, at what versionstamp, so retries never double-apply.
-- **Resolvers (N, partitioned by key range or slot).** Conflict detection scales out.
-- **Transaction logs (replicated).** Commits become durable once a quorum of log replicas has
-  them. Storage servers *pull* from the logs by version, so a lagging or restarted replica just
-  resumes from its version, with no coordinator-held resend buffers and no truncation-based
-  recovery. Recovery then becomes: lock the old log generation, find the durable end, start a
-  new generation.
-- Simulation grows with it: log and coordinator faults, quorum partitions, clock skew.
+## Known limitations
 
-## Then: performance
-
-Target: **Redis-class single-key throughput and latency**, measured side by side in the same
-k3s cluster:
-
-- `redis-benchmark` against Redis 7 vs. an equivalent SwiftCache harness (`swiftcache-cli bench`
-  extended with matching key and value sizes, pipelining and connection counts).
-- Report GET/SET ops/s, p50/p99/p999 latency, plus transactional workloads (bank transfers vs
-  Redis `WATCH`/`MULTI`).
-- Likely work: multi-threaded storage servers (shard-per-core), read fast paths that skip the
-  version wait when the requested version is already known committed, request pipelining,
-  cheaper wire encoding (avoid `[UInt8]` copies, using `ByteBuffer` end to end), batching tuned
-  for latency vs throughput, and GRV batching/caching.
+- **In-memory durability.** Logs and storage keep data in memory, replicated. Losing every
+  log of a generation at once loses commits not yet applied by storage. Losing every replica
+  of a shard loses that shard. Coordinators *are* durable (fsync).
+- **Static coordinator set.** Changing coordinators requires redeploying with a new cluster
+  file (FoundationDB supports online coordinator changes).
+- **One resolver.** The resolver role is a single instance per generation (multiple proxies
+  are supported). Partitioning resolvers by key range is a later step.
+- **Full replication of logs.** Every log stores every mutation. FoundationDB assigns tags to
+  a subset of logs.
+- **No scale-down / exclusion** of storage servers.
+- **No eviction / max-memory policy.**
+- **No TLS or authentication** on the wire.
+- **Clients need pod-network access**, since they route directly to proxies and storage pods.
+- **Range reads scatter to every shard** (hash partitioning).
+- **Clock assumptions.** Leases assume clocks advance at similar rates (no huge skew in
+  *rate*; absolute skew doesn't matter). Safety never depends on this: fencing via the
+  generation register does.
 
 ## Later
 
-- Scale-down / shard draining and an admin API to exclude servers.
-- Optional persistence (snapshot + log replay) for warm restarts.
-- Max-memory and eviction policies.
-- Watches (notify on key change, as in FoundationDB watches).
-- TLS and auth.
-- Metrics (Prometheus) and tracing.
+- Optional persistence (log and storage on disk) for warm restarts.
+- Watches, eviction policies, metrics (Prometheus), tracing.
 - A RESP (Redis protocol) gateway for drop-in compatibility.

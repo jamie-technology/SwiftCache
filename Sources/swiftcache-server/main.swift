@@ -4,86 +4,69 @@ import SwiftCacheCore
 import SwiftCacheNet
 import SwiftCacheServer
 
-struct ClusterOptions: ParsableArguments {
-    @Option(help: "Replicas per shard (coordinator).") var replication: Int = 2
-    @Option(help: "MVCC window in seconds: how far back historical reads are served.") var mvccWindow: Double = 10
-    @Option(help: "Seconds without acknowledgements before a replica is declared failed.") var failureTimeout: Double = 3
-    @Option(help: "Seconds the last live replica of a shard may be silent before its data is given up.") var shardLossTimeout: Double = 120
-    @Option(help: "Seconds a restarting coordinator waits for storage reports.") var recoveryWindow: Double = 3
-    @Option(help: "Seconds a storage server waits before rejoining a silent coordinator.") var coordinatorTimeout: Double = 2
-    @Option(help: "Log level: debug, info, warning, error.") var logLevel: String = "info"
-
-    var config: ClusterConfig {
-        var c = ClusterConfig()
-        c.replicationFactor = replication
-        c.mvccWindow = UInt64(mvccWindow * 1_000_000)
-        c.failureTimeout = UInt64(failureTimeout * 1_000_000)
-        c.shardLossTimeout = UInt64(shardLossTimeout * 1_000_000)
-        c.recoveryWindow = UInt64(recoveryWindow * 1_000_000)
-        c.coordinatorTimeout = UInt64(coordinatorTimeout * 1_000_000)
-        // Real networks: allow more time for snapshots and slow reads than the simulator.
-        c.readWaitTimeout = 2_000_000
-        c.snapshotTimeout = 15_000_000
-        c.moveTimeout = 120_000_000
-        return c
-    }
-
-    var level: LogLevel {
-        switch logLevel.lowercased() {
-        case "debug": .debug
-        case "warning", "warn": .warning
-        case "error": .error
-        default: .info
-        }
-    }
-}
-
-func splitListen(_ s: String) throws -> (String, Int) {
-    guard let (h, p) = parseEndpoint(s) else { throw ValidationError("expected host:port, got \(s)") }
-    return (h, p)
-}
-
 @main
 struct Server: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "swiftcache-server",
-        abstract: "SwiftCache server processes.",
-        subcommands: [CoordinatorCommand.self, StorageCommand.self])
-}
+        abstract: "A SwiftCache process. Its class decides which roles the cluster may give it.",
+        discussion: """
+        Classes:
+          stateless  cluster controller candidate, master, commit proxies, resolvers
+          log        transaction logs
+          storage    one storage server
+        Any process can also be a coordinator (--coordinator); every process must be given
+        the same --coordinators list (the cluster file).
+        """)
 
-struct CoordinatorCommand: ParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "coordinator", abstract: "Run the coordinator (sequencer, resolver, cluster controller).")
-    @Option(help: "Address to bind.") var listen = "0.0.0.0:7400"
-    @Option(help: "Endpoint other processes use to reach this one (host:port).") var advertise: String
-    @OptionGroup var cluster: ClusterOptions
+    @Option(help: "Process class: stateless, log or storage.") var `class`: String
+    @Option(help: "Address to bind.") var listen = "0.0.0.0:4500"
+    @Option(help: "Address other processes use to reach this one (host:port).") var advertise: String
+    @Option(help: "Comma-separated coordinator addresses (host:port,...).") var coordinators: String
+    @Flag(help: "This process is one of the coordinators (needs --data-dir).") var coordinator = false
+    @Option(help: "Directory for durable coordinator state.") var dataDir: String?
+
+    @Option(help: "Storage replicas per shard.") var replication: Int = 2
+    @Option(help: "Transaction logs per generation.") var logs: Int = 3
+    @Option(help: "Commit proxies per generation.") var proxies: Int = 2
+    @Option(help: "MVCC window in seconds (how far back reads are served).") var mvccWindow: Double = 10
+    @Option(help: "Seconds without a registration before a process is considered dead.") var failureTimeout: Double = 3
+    @Option(help: "Seconds the last replica of a shard may be gone before its data is given up.") var shardLossTimeout: Double = 120
+    @Option(help: "Log level: debug, info, warning, error.") var logLevel: String = "info"
 
     func run() throws {
-        let (host, port) = try splitListen(listen)
-        let config = cluster.config
-        let advertise = self.advertise
-        let nodeHost = NodeHost(endpoint: advertise, logLevel: cluster.level)
-        nodeHost.log(.info, "coordinator \(advertise) replication=\(config.replicationFactor) mvccWindow=\(config.mvccWindow / 1_000_000)s")
-        try nodeHost.run(bindHost: host, port: port) { env in
-            Coordinator(endpoint: advertise, config: config, env: env)
+        guard let cls = ProcessClass(name: self.class) else { throw ValidationError("--class must be stateless, log or storage") }
+        if coordinator && dataDir == nil { throw ValidationError("coordinators need --data-dir for their durable state") }
+        guard let (host, port) = parseEndpoint(listen) else { throw ValidationError("--listen must be host:port") }
+        var config = ClusterConfig()
+        config.replicationFactor = replication
+        config.logReplicas = logs
+        config.commitProxies = proxies
+        config.mvccWindow = UInt64(mvccWindow * 1_000_000)
+        config.failureTimeout = UInt64(failureTimeout * 1_000_000)
+        config.shardLossTimeout = UInt64(shardLossTimeout * 1_000_000)
+        // Real networks and schedulers are slower and noisier than the simulator.
+        config.leaseTimeout = 3_000_000
+        config.leaderHeartbeatInterval = 300_000
+        config.leaderStepDownTimeout = 1_800_000
+        config.registrationInterval = 300_000
+        config.controllerWarmup = 2_000_000
+        config.recoveryTimeout = 15_000_000
+        config.requestTimeout = 2_000_000
+        config.readWaitTimeout = 2_000_000
+        config.snapshotTimeout = 15_000_000
+        config.moveTimeout = 120_000_000
+        let level: LogLevel = ["debug": .debug, "warning": .warning, "error": .error][logLevel.lowercased()] ?? .info
+
+        let coordinatorEndpoints = coordinators.split(separator: ",").map {
+            ServerProcess.coordinatorEndpoint(String($0).trimmingCharacters(in: .whitespaces))
         }
-    }
-}
-
-struct StorageCommand: ParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "storage", abstract: "Run a storage server (one replica of one shard).")
-    @Option(help: "Address to bind.") var listen = "0.0.0.0:7500"
-    @Option(help: "Endpoint other processes use to reach this one (host:port).") var advertise: String
-    @Option(help: "Coordinator endpoint (host:port).") var coordinator: String
-    @OptionGroup var cluster: ClusterOptions
-
-    func run() throws {
-        let (host, port) = try splitListen(listen)
-        let config = cluster.config
-        let advertise = self.advertise, coordinator = self.coordinator
-        let nodeHost = NodeHost(endpoint: advertise, logLevel: cluster.level)
-        nodeHost.log(.info, "storage \(advertise) coordinator=\(coordinator)")
+        let isCoordinator = coordinator
+        let finalConfig = config
+        let nodeHost = try NodeHost(address: advertise, dataDirectory: dataDir, logLevel: level)
+        nodeHost.log(.info, "\(advertise): class=\(cls) coordinator=\(isCoordinator) coordinators=\(coordinators)")
         try nodeHost.run(bindHost: host, port: port) { env in
-            StorageServer(endpoint: advertise, coordinator: coordinator, config: config, env: env)
+            ServerProcess.make(env: env, processClass: cls, isCoordinator: isCoordinator,
+                               coordinators: coordinatorEndpoints, config: finalConfig)
         }
     }
 }

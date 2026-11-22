@@ -87,6 +87,9 @@ public struct DatabaseOptions: Sendable {
     public var initialBackoff: UInt64 = 5_000
     /// Maximum retry backoff (µs).
     public var maxBackoff: UInt64 = 500_000
+    /// Seconds an idempotent operation's commit record is kept (bounds how long after an
+    /// unknown result a retry can still be deduplicated).
+    public var idempotencyRetention: UInt32 = 600
 
     public init() {}
 }

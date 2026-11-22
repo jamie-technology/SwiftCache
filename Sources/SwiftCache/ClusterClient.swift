@@ -1,60 +1,120 @@
 import Synchronization
 import SwiftCacheCore
 
-/// Low-level request routing: talks to the coordinator for versions/commits/topology and to
-/// storage replicas for reads, refreshing the cached topology when it goes stale.
+/// Low-level request routing. Finds the cluster controller through the coordinators,
+/// gets `ClientInfo` (proxies + topology) from it, sends read versions and commits to the
+/// current generation's commit proxies, and reads directly from storage replicas,
+/// refreshing its cached information whenever something looks stale.
 final class ClusterClient: Sendable {
-    let coordinator: Endpoint
+    let coordinators: [Endpoint]
     let transport: any ClientTransport
     let options: DatabaseOptions
-    private let cachedTopology = Mutex<Topology?>(nil)
+    private let cached = Mutex<ClientInfo?>(nil)
+    private let controller = Mutex<Endpoint?>(nil)
 
-    init(coordinator: Endpoint, transport: any ClientTransport, options: DatabaseOptions) {
-        self.coordinator = coordinator
+    init(coordinators: [Endpoint], transport: any ClientTransport, options: DatabaseOptions) {
+        self.coordinators = coordinators.map { $0.contains("#") ? $0 : $0 + "#coord" }
         self.transport = transport
         self.options = options
     }
 
-    // MARK: Coordinator
+    // MARK: Discovery
+
+    private func findController() async throws -> Endpoint {
+        if let c = controller.withLock({ $0 }) { return c }
+        let start = Int(transport.random(UInt64(max(1, coordinators.count))))
+        for i in 0..<coordinators.count {
+            let c = coordinators[(start + i) % coordinators.count]
+            if case .leaderReply(_, let leader?)? = try? await transport.request(to: c, timeout: options.requestTimeout, { .getLeader(rid: $0) }) {
+                controller.withLock { $0 = leader.endpoint }
+                return leader.endpoint
+            }
+        }
+        throw SwiftCacheError.unavailable("no coordinator knows a cluster controller")
+    }
+
+    func clientInfo(refresh: Bool = false) async throws -> ClientInfo {
+        if !refresh, let info = cached.withLock({ $0 }) { return info }
+        for _ in 0..<2 {
+            let cc = try await findController()
+            let reply = try? await transport.request(to: cc, timeout: options.requestTimeout) { .getClientInfo(rid: $0) }
+            switch reply {
+            case .clientInfoReply(_, let info)?:
+                cached.withLock { $0 = info }
+                return info
+            case .errorReply(_, .unavailable)?:
+                throw SwiftCacheError.unavailable("cluster is recovering")
+            default:
+                controller.withLock { $0 = nil }  // that controller is gone; ask the coordinators again
+            }
+        }
+        throw SwiftCacheError.unavailable("cluster controller unreachable")
+    }
+
+    /// Forget cached routing information.
+    func invalidate() {
+        cached.withLock { $0 = nil }
+    }
+
+    private func proxy() async throws -> Endpoint {
+        let info = try await clientInfo()
+        guard !info.proxies.isEmpty else { throw SwiftCacheError.unavailable("no commit proxies") }
+        return info.proxies[Int(transport.random(UInt64(info.proxies.count)))]
+    }
+
+    // MARK: Proxies
 
     func readVersion() async throws -> Version {
+        let p = try await proxy()
         let reply: Message
         do {
-            reply = try await transport.request(to: coordinator, timeout: options.requestTimeout) { .getReadVersion(rid: $0) }
-        } catch let e as TransportError {
-            throw SwiftCacheError.unavailable("coordinator: \(e)")
+            reply = try await transport.request(to: p, timeout: options.requestTimeout) { .getReadVersion(rid: $0) }
+        } catch {
+            invalidate()
+            throw SwiftCacheError.unavailable("proxy \(p): \(error)")
         }
         switch reply {
         case .readVersionReply(_, let v): return v
-        case .errorReply(_, let code): throw SwiftCacheError(code: code)
+        case .errorReply(_, let code):
+            invalidate()
+            throw SwiftCacheError(code: code)
         default: throw SwiftCacheError.internalError("unexpected reply \(reply.name)")
         }
     }
 
     func commit(_ request: CommitRequest) async throws -> Versionstamp {
+        let p = try await proxy()
         let reply: Message
         do {
-            reply = try await transport.request(to: coordinator, timeout: options.requestTimeout) { .commit(rid: $0, request) }
-        } catch is TransportError {
+            reply = try await transport.request(to: p, timeout: options.requestTimeout) { .commit(rid: $0, request) }
+        } catch {
+            invalidate()
             throw SwiftCacheError.commitUnknownResult
         }
         switch reply {
         case .commitReply(_, .committed(let stamp)): return stamp
-        case .commitReply(_, .failed(let code)): throw SwiftCacheError(code: code)
-        case .errorReply(_, let code): throw SwiftCacheError(code: code)
+        case .commitReply(_, .failed(let code)):
+            if code == .unavailable { invalidate() }
+            throw SwiftCacheError(code: code)
+        case .errorReply(_, let code):
+            // The proxy no longer exists / ended before taking the request: not committed.
+            invalidate()
+            throw SwiftCacheError(code: code)
         default: throw SwiftCacheError.internalError("unexpected reply \(reply.name)")
         }
     }
 
+    // MARK: Admin
+
     func status() async throws -> ClusterStatus {
-        let reply: Message
-        do {
-            reply = try await transport.request(to: coordinator, timeout: options.requestTimeout) { .getStatus(rid: $0) }
-        } catch let e as TransportError {
-            throw SwiftCacheError.unavailable("coordinator: \(e)")
+        for _ in 0..<2 {
+            let cc = try await findController()
+            if case .statusReply(_, let s)? = try? await transport.request(to: cc, timeout: options.requestTimeout, { .getStatus(rid: $0) }) {
+                return s
+            }
+            controller.withLock { $0 = nil }
         }
-        guard case .statusReply(_, let s) = reply else { throw SwiftCacheError.internalError("unexpected reply \(reply.name)") }
-        return s
+        throw SwiftCacheError.unavailable("cluster controller unreachable")
     }
 
     func storageStats(_ endpoint: Endpoint) async throws -> StorageStats {
@@ -66,19 +126,7 @@ final class ClusterClient: Sendable {
     // MARK: Topology
 
     func topology(refresh: Bool = false) async throws -> Topology {
-        if !refresh, let t = cachedTopology.withLock({ $0 }) { return t }
-        let reply: Message
-        do {
-            reply = try await transport.request(to: coordinator, timeout: options.requestTimeout) { .getTopology(rid: $0) }
-        } catch let e as TransportError {
-            throw SwiftCacheError.unavailable("coordinator: \(e)")
-        }
-        guard case .topologyReply(_, let t) = reply else {
-            if case .errorReply(_, let code) = reply { throw SwiftCacheError(code: code) }
-            throw SwiftCacheError.internalError("unexpected reply \(reply.name)")
-        }
-        cachedTopology.withLock { $0 = t }
-        return t
+        try await clientInfo(refresh: refresh).topology
     }
 
     private func replicaOrder(_ replicas: [Endpoint]) -> [Endpoint] {

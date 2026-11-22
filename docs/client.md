@@ -8,12 +8,16 @@
 
 ```swift
 import SwiftCache
-let db = try await Database.connect(coordinator: "swiftcache-coordinator.swiftcache.svc.cluster.local:7400")
+// The "cluster file": the coordinators' addresses (same list every process uses).
+let db = try await Database.connect(cluster: ProcessInfo.processInfo.environment["SWIFTCACHE_CLUSTER"]!)
+// or: Database.connect(coordinators: ["coord-0:4500", "coord-1:4500", "coord-2:4500"])
 ```
 
-The client fetches the cluster topology from the coordinator and talks to storage pods
-directly, so it must be able to resolve and reach the pod DNS names. Run it inside the cluster.
-`Database` is `Sendable`; create one per process and share it.
+The client asks the coordinators which process is cluster controller, gets the current
+generation's commit proxies and the shard topology from it, and then talks to proxies and
+storage pods directly. It must be able to resolve and reach the pod DNS names, so run it
+inside the cluster. It refreshes this information automatically when a generation changes
+or a shard moves. `Database` is `Sendable`; create one per process and share it.
 
 ## Keys and values
 
@@ -26,8 +30,8 @@ directly, so it must be able to resolve and reach the pod DNS names. Run it insi
 
 | Method | Description |
 | --- | --- |
-| `transaction { tr in … }` | Serializable transaction with automatic retry. Returns the closure's result. |
-| `transactionWithVersionstamp { tr in … }` | Same, plus the commit's versionstamp. |
+| `transaction(idempotent:) { tr in … }` | Serializable transaction with automatic retry. Returns the closure's result. `idempotent: true` = applied exactly once even across unknown commit results ([details](transactions.md#idempotency)). |
+| `transactionWithVersionstamp(idempotent:) { tr in … }` | Same, plus the commit's versionstamp. |
 | `read(atVersion:) { tr in … }` | Read-only transaction pinned to a historical version. |
 | `createTransaction()` | Manually driven transaction (you call `commit()`; no retries). |
 | `readVersion()` | Latest committed version (a consistency token). |
@@ -35,11 +39,14 @@ directly, so it must be able to resolve and reach the pod DNS names. Run it insi
 | `getVersioned(key)` | Value plus the versionstamp of its last write. |
 | `set(key, value, ttl:)` | Write; returns the versionstamp. |
 | `clear(key)` | Delete; returns the versionstamp. |
-| `add(key, delta)` | Atomic Int64 add (doesn't retry unknown results). |
+| `add(key, delta)` | Atomic Int64 add (idempotent: applied exactly once). |
 | `compareAndSwap(key:expectedVersion:newValue:ttl:)` | Write iff the key's versionstamp matches (`nil` = absent). |
 | `compareAndDelete(key:expectedVersion:)` | Delete iff the versionstamp matches. |
 | `getRange(prefix:limit:)`, `getRange(from:to:limit:)` | Ordered range reads across all shards. |
-| `status()`, `storageStats(endpoint)` | Admin and introspection. |
+| `status()`, `storageStats(endpoint)` | Admin and introspection (roles, generation, topology, processes). |
+
+The single-key conveniences (`set`, `clear`, `add`, `compareAndSwap`, `compareAndDelete`)
+are idempotent.
 
 ## `Transaction`
 
@@ -105,6 +112,6 @@ let page2 = try await db.read(atVersion: v) { try await $0.getRange(from: cursor
 
 ## Testing your own code against a simulated cluster
 
-`SwiftCacheSim` exposes the simulator, and `Database(coordinator:transport:)` accepts its
+`SwiftCacheSim` exposes the simulator, and `Database(coordinators:transport:)` accepts its
 transport, so you can run your own logic against a faulty simulated cluster deterministically
 (see `Sources/SwiftCacheSim/Workloads.swift`).

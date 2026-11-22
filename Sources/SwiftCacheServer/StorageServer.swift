@@ -1,248 +1,204 @@
 import SwiftCacheCore
 
-/// A storage server: one replica of one shard.
+/// A storage server: one replica of one shard (or idle, waiting to be given one).
 ///
-/// It receives an ordered stream of batches from the coordinator, applies them to its
-/// multi-version store and serves reads at any version inside the MVCC window. A read
-/// at version `v` is only answered once the server has applied `v` *and* knows `v` is
-/// committed cluster-wide, so a lagging or partitioned replica can never return stale
-/// data — at worst it makes the client wait and try another replica.
-public final class StorageServer: ServerNode {
-    public let endpoint: Endpoint
-    public let coordinator: Endpoint
+/// It *pulls* its tag's mutations from the transaction logs (`peek`), applies them to its
+/// multi-version store, and releases them (`pop`). Logs only hand out versions known to be
+/// committed on every log, so everything a storage server applies is durable; reads at
+/// version `v` are served once `v` has been applied. A lagging or partitioned replica can
+/// never return stale data — at worst it makes the client wait and try another replica.
+///
+/// Membership changes arrive as metadata ops in its tag's stream, at exact versions.
+public final class StorageServer: Role {
+    public let context: RoleContext
     let config: ClusterConfig
-    let env: any NodeEnvironment
-
     let store = VersionedStore()
 
-    // Membership.
-    private(set) var shardID: Int32 = -1
-    private(set) var coordinatorEpoch: UInt64 = 0
-    private(set) var isActive = false
-    private var awaitingFirstBatch = false
-
-    // Versions.
-    private(set) var applied: Version = 0
-    private(set) var committed: Version = 0
+    public private(set) var tag: Tag = 0
+    public private(set) var shardID: Int32 = -1
+    /// False while copying the shard's data after joining it.
+    public private(set) var isActive = false
+    public private(set) var applied: Version = 0
     private(set) var oldestReadable: Version = 0
+    public private(set) var owned = SlotSet()
 
-    /// Slots this server serves reads for.
-    private(set) var owned = SlotSet()
-    /// Ownership before each change, for rolling back during recovery.
-    private var ownershipLog: [(version: Version, before: SlotSet)] = []
+    private var dbInfo = ServerDBInfo.empty
+    private var peekInFlight = false
+    private var peekCursor = 0
+    private var lastPopped: Version = 0
+    private var tagRetired = Set<Tag>()
 
-    private var lastCoordinatorContact: UInt64 = 0
-    private var lastGapReport: UInt64 = 0
-    private var started = false
-
-    // Data movement into this server.
     struct Receive {
         var moveID: UInt64
         var slots: SlotSet
         var sources: [Endpoint]
         var startVersion: Version
-        /// Mutations for `slots` received before the snapshot was installed.
         var buffer: [(stamp: Versionstamp, mutation: Mutation)] = []
         var snapshotRid: UInt64 = 0
         var snapshotAttempt = 0
         var snapshotItems: [SnapshotChunk.Item] = []
         /// Set once the snapshot is installed: mutations at or below this version for
-        /// `slots` were already included in the snapshot and must be skipped.
-        var installedThrough: Version? = nil
+        /// `slots` were already in it and must be skipped (0 once our stream has passed it).
+        var installedThrough: Version?
         var isCatchUp: Bool
+        /// The controller has acknowledged readiness (replicaReady / transfer seen).
+        var acknowledged = false
     }
     private var receives: [UInt64: Receive] = [:]
 
-    // Reads waiting for a version to become readable.
     private struct Waiter {
         var id: UInt64
         var version: Version
-        var needsCommitted: Bool
         var run: () -> Void
         var expire: () -> Void
     }
     private var waiters: [Waiter] = []
     private var nextWaiterID: UInt64 = 0
     private var nextRid: UInt64 = 1
+    private var snapshotRequests: [UInt64: UInt64] = [:]  // our rid -> moveID
 
-    public init(endpoint: Endpoint, coordinator: Endpoint, config: ClusterConfig, env: any NodeEnvironment) {
-        self.endpoint = endpoint
-        self.coordinator = coordinator
+    init(context: RoleContext, config: ClusterConfig) {
+        self.context = context
         self.config = config
-        self.env = env
     }
-
-    // MARK: Lifecycle
 
     public func start() {
-        guard !started else { return }
-        started = true
-        lastCoordinatorContact = 0
-        sendJoin()
-        scheduleHousekeeping()
+        context.every(config.popInterval) { [weak self] in self?.housekeeping() }
     }
 
-    private func scheduleHousekeeping() {
-        env.schedule(after: config.joinInterval) { [weak self] in
-            guard let self else { return }
-            if self.env.now &- self.lastCoordinatorContact >= self.config.coordinatorTimeout {
-                self.sendJoin()
-            }
-            self.scheduleHousekeeping()
+    /// Every visible key/value in owned slots at `version` (for consistency checks).
+    public func debugContents(at version: Version) -> [Bytes: Bytes] {
+        var out: [Bytes: Bytes] = [:]
+        for (key, versions) in store.data where owned.contains(Slots.slot(for: key)) {
+            var v: VersionedValue?
+            for x in versions where x.stamp.version <= version { v = x }
+            if let value = v?.visibleValue(at: version) { out[key] = value }
         }
+        return out
+    }
+
+    /// The stored versions of one key (debugging).
+    public func debugVersions(_ key: Bytes) -> [Versionstamp] {
+        store.data[key]?.map(\.stamp) ?? []
     }
 
     var report: StorageReport {
-        StorageReport(endpoint: endpoint, shardID: shardID, coordinatorEpoch: coordinatorEpoch,
-                      appliedVersion: applied, committedVersion: committed, isActive: isActive && !awaitingFirstBatch, ownedSlots: owned)
-    }
-
-    private func sendJoin() {
-        env.send(.join(report), to: coordinator)
-    }
-
-    // MARK: Message dispatch
-
-    public func receive(_ message: Message, from: Endpoint) {
-        switch message {
-        case .batch(let b):
-            if from == coordinator { handleBatch(b) }
-        case .assign(let a):
-            if from == coordinator { handleAssign(a) }
-        case .recover(let epoch, let truncateTo):
-            if from == coordinator { handleRecover(epoch: epoch, truncateTo: truncateTo) }
-        case .read(let rid, let key, let version):
-            handleRead(rid: rid, key: key, version: version, from: from)
-        case .readRange(let rid, let range, let version, let limit):
-            handleRange(rid: rid, range: range, version: version, limit: Int(limit), from: from)
-        case .fetchSnapshot(let rid, let slots, let minVersion):
-            handleFetchSnapshot(rid: rid, slots: slots, minVersion: minVersion, from: from)
-        case .snapshotChunk(let rid, let chunk):
-            handleSnapshotChunk(rid: rid, chunk: chunk, from: from)
-        case .getStorageStats(let rid):
-            env.send(.storageStatsReply(rid: rid, stats), to: from)
-        default:
-            if let rid = message.rid { env.send(.errorReply(rid: rid, .invalidRequest), to: from) }
-        }
+        StorageReport(endpoint: context.endpoint, tag: tag, appliedVersion: applied)
     }
 
     public var stats: StorageStats {
-        StorageStats(endpoint: endpoint, shardID: shardID, isActive: isActive, appliedVersion: applied,
-                     committedVersion: committed, keyCount: UInt64(store.keyCount),
-                     versionCount: UInt64(store.versionCount), approximateBytes: UInt64(max(0, store.approximateBytes)),
-                     ownedSlots: UInt32(owned.count))
+        StorageStats(endpoint: context.endpoint, tag: tag, shardID: shardID, isActive: isActive, appliedVersion: applied,
+                     keyCount: UInt64(store.keyCount), versionCount: UInt64(store.versionCount),
+                     approximateBytes: UInt64(max(0, store.approximateBytes)), ownedSlots: UInt32(owned.count))
     }
 
-    // MARK: Membership
+    // MARK: Cluster information
 
-    private func resetState() {
-        store.removeAll()
-        receives = [:]
-        owned = SlotSet()
-        ownershipLog = []
+    func updateDBInfo(_ info: ServerDBInfo) {
+        let changed = info.tlogs != dbInfo.tlogs
+        dbInfo = info
+        if changed { peekCursor = 0 }
+        pullIfNeeded()
+    }
+
+    /// The controller tells us our tag once it has committed our membership.
+    func assignTag(_ assigned: Tag) {
+        guard assigned != 0, tag == 0, !tagRetired.contains(assigned) else { return }
+        tag = assigned
         applied = 0
-        committed = 0
-        oldestReadable = 0
+        context.log(.info, "assigned tag \(assigned)")
+        pullIfNeeded()
+    }
+
+    private func wipe(_ reason: String) {
+        context.log(.warning, "wiping (\(reason)); waiting for a new assignment")
+        if tag != 0 { tagRetired.insert(tag) }
+        tag = 0
+        shardID = -1
         isActive = false
+        applied = 0
+        lastPopped = 0
+        oldestReadable = 0
+        owned = SlotSet()
+        receives = [:]
+        store.removeAll()
         let old = waiters
         waiters = []
         for w in old { w.expire() }
     }
 
-    private func handleAssign(_ a: Assignment) {
-        guard a.coordinatorEpoch >= coordinatorEpoch else { return }
-        coordinatorEpoch = a.coordinatorEpoch
-        lastCoordinatorContact = env.now
-        resetState()
-        shardID = a.shardID
-        awaitingFirstBatch = true
-        switch a.mode {
-        case .activeEmpty:
-            owned = a.slots
-            isActive = true
-        case .catchUp:
-            isActive = false
+    // MARK: Pulling from the logs
+
+    private func pullIfNeeded() {
+        guard tag != 0, !peekInFlight, !dbInfo.tlogs.isEmpty else { return }
+        peekInFlight = true
+        let tlog = dbInfo.tlogs[peekCursor % dbInfo.tlogs.count]
+        let myTag = tag
+        let after = applied
+        context.request(to: tlog, timeout: config.peekTimeout + config.requestTimeout, {
+            .tlogPeek(rid: $0, tag: myTag, from: after, upTo: 0)
+        }) { [weak self] reply in
+            guard let self else { return }
+            self.peekInFlight = false
+            guard self.tag == myTag else { return self.pullIfNeeded() }
+            switch reply {
+            case .tlogPeekReply(_, let p)?:
+                switch p.status {
+                case .ok:
+                    self.applyPeek(p)
+                    self.pullIfNeeded()
+                case .tooOld:
+                    self.wipe("log no longer has versions after \(after) for tag \(myTag)")
+                case .tagRemoved:
+                    self.wipe("tag \(myTag) was retired")
+                case .stopped:
+                    // That log was locked by a recovery; wait for the new generation's logs.
+                    self.peekCursor += 1
+                    self.context.schedule(after: 100_000) { self.pullIfNeeded() }
+                }
+            default:
+                self.peekCursor += 1
+                self.context.schedule(after: 20_000) { self.pullIfNeeded() }
+            }
         }
-        env.log(.info, "\(endpoint): assigned to shard \(a.shardID) mode=\(a.mode) slots=\(a.slots.count)")
     }
 
-    private func handleRecover(epoch: UInt64, truncateTo: Version) {
-        guard epoch >= coordinatorEpoch else { return }
-        coordinatorEpoch = epoch
-        lastCoordinatorContact = env.now
-        // Abandon in-flight data movement: drop anything we were receiving but don't own.
-        for id in receives.keys.sorted() {
-            let r = receives[id]!
-            store.drop(slots: r.slots.subtracting(owned))
-        }
-        receives = [:]
-        if isActive && !awaitingFirstBatch && applied >= truncateTo {
-            store.truncate(after: truncateTo)
-            while let last = ownershipLog.last, last.version > truncateTo {
-                owned = last.before
-                ownershipLog.removeLast()
+    private func applyPeek(_ p: PeekReply) {
+        for e in p.entries where e.version > applied {
+            for (order, m) in e.mutations {
+                applyMutation(m, stamp: Versionstamp(version: e.version, order: order))
             }
-            applied = truncateTo
-            committed = min(committed, truncateTo)
-            env.log(.info, "\(endpoint): recovered, truncated to \(truncateTo)")
-        } else {
-            // We can't be made consistent at `truncateTo`; report as inactive so the
-            // coordinator re-syncs us from a peer.
-            let shard = shardID
-            resetState()
-            shardID = shard
-            awaitingFirstBatch = false
-            env.log(.info, "\(endpoint): recovery requires resync (applied=\(applied))")
+            for op in e.meta { applyMeta(op, version: e.version) }
+            if tag == 0 { return }  // removed from the shard by this entry
         }
-        env.send(.recoverReply(report), to: coordinator)
-    }
-
-    // MARK: Batches
-
-    private func handleBatch(_ b: Batch) {
-        guard b.coordinatorEpoch == coordinatorEpoch, shardID >= 0 else { return }
-        lastCoordinatorContact = env.now
-        if awaitingFirstBatch {
-            applied = b.prevVersion
-            awaitingFirstBatch = false
-        }
-        if b.version <= applied { return }  // duplicate
-        guard b.prevVersion == applied else {
-            // We missed batches (a connection broke). Drop this one and ask the
-            // coordinator to resend from our applied version; it re-syncs us from a peer
-            // only if it no longer has those batches.
-            if env.now &- lastGapReport >= 100_000 {
-                lastGapReport = env.now
-                env.log(.info, "\(endpoint): batch gap (have \(applied), got prev \(b.prevVersion)); requesting resend")
-                sendJoin()
-            }
-            return
-        }
-
-        for entry in b.entries {
-            let stamp = Versionstamp(version: b.version, order: entry.order)
-            for m in entry.mutations { applyMutation(m, stamp: stamp) }
-        }
-        for op in b.meta { applyMeta(op, version: b.version) }
-
-        applied = b.version
-        committed = max(committed, min(b.committedVersion, applied))
-        if b.oldestVersion > oldestReadable {
-            oldestReadable = min(b.oldestVersion, committed)
-            store.collectGarbage(oldest: oldestReadable)
-            ownershipLog.removeAll { $0.version < committed }
-        }
-        // Once our stream has passed a snapshot's version, nothing more needs skipping.
+        if p.end > applied { applied = p.end }
+        // Once our stream passes a snapshot's version, nothing more needs skipping.
         for id in receives.keys.sorted() {
             guard let through = receives[id]?.installedThrough, through != 0, through <= applied else { continue }
-            if receives[id]!.isCatchUp {
-                receives[id] = nil
-            } else {
-                receives[id]!.installedThrough = 0  // keep the receive (marks "ready") until transfer
+            receives[id]!.installedThrough = 0
+            if receives[id]!.isCatchUp && receives[id]!.acknowledged { receives[id] = nil }
+        }
+        if applied > config.mvccWindow, applied - config.mvccWindow > oldestReadable {
+            oldestReadable = applied - config.mvccWindow
+            store.collectGarbage(oldest: oldestReadable)
+        }
+        wakeWaiters()
+    }
+
+    private func housekeeping() {
+        // Release applied data on every log.
+        if tag != 0, applied > lastPopped {
+            lastPopped = applied
+            for t in dbInfo.tlogs { context.send(.tlogPop(tag: tag, version: applied), to: t) }
+        }
+        // Keep telling the controller about finished copies until it acts on them.
+        for id in receives.keys.sorted() {
+            let r = receives[id]!
+            if r.installedThrough != nil && !r.acknowledged && !dbInfo.clusterController.isEmpty {
+                context.send(.moveReady(moveID: id, tag: tag), to: dbInfo.clusterController)
             }
         }
-        env.send(.batchAck(version: b.version, coordinatorEpoch: coordinatorEpoch), to: coordinator)
-        wakeWaiters()
+        pullIfNeeded()
     }
 
     private func receiveFor(slot: Int) -> UInt64? {
@@ -251,8 +207,7 @@ public final class StorageServer: ServerNode {
     }
 
     private func applyMutation(_ m: Mutation, stamp: Versionstamp) {
-        let slot = Slots.slot(for: m.key)
-        if !receives.isEmpty, let id = receiveFor(slot: slot) {
+        if !receives.isEmpty, let id = receiveFor(slot: Slots.slot(for: m.key)) {
             if let through = receives[id]!.installedThrough {
                 if stamp.version > through { store.apply(m, stamp: stamp) }
             } else {
@@ -263,121 +218,131 @@ public final class StorageServer: ServerNode {
         store.apply(m, stamp: stamp)
     }
 
-    private func changeOwnership(at version: Version, _ change: (inout SlotSet) -> Void) {
-        ownershipLog.append((version, owned))
-        change(&owned)
-    }
-
     private func applyMeta(_ op: MetaOp, version: Version) {
         switch op {
-        case .beginReceive(let moveID, let shard, let slots, let sources):
-            guard shard == shardID else { return }
-            var r = Receive(moveID: moveID, slots: slots, sources: sources, startVersion: version, isCatchUp: !isActive)
-            r.snapshotAttempt = 0
-            receives[moveID] = r
-            env.log(.info, "\(endpoint): begin receive move \(moveID) slots=\(slots.count) catchUp=\(r.isCatchUp)")
+        case .createShard(let id, let members, let slots):
+            guard members.contains(where: { $0.tag == tag }) else { return }
+            shardID = id
+            owned = slots
+            isActive = true
+            context.log(.info, "member of new shard \(id) with \(slots.count) slots")
+
+        case .addReplica(let id, let member, let moveID, let sources, let slots):
+            guard member.tag == tag else { return }
+            shardID = id
+            isActive = false
+            receives[moveID] = Receive(moveID: moveID, slots: slots, sources: sources, startVersion: version, isCatchUp: true)
+            context.log(.info, "joining shard \(id): copying \(slots.count) slots from \(sources.count) peers")
             requestSnapshot(moveID)
 
-        case .abortReceive(let moveID, _):
-            guard let r = receives.removeValue(forKey: moveID) else { return }
-            store.drop(slots: r.slots.subtracting(owned))
-            env.log(.info, "\(endpoint): aborted receive move \(moveID)")
+        case .replicaReady(_, let t):
+            guard t == tag else { return }
+            for id in receives.keys.sorted() where receives[id]!.isCatchUp {
+                receives[id]!.acknowledged = true
+                if receives[id]!.installedThrough == 0 { receives[id] = nil }
+            }
+
+        case .removeReplica(_, let t):
+            if t == tag { wipe("removed from shard \(shardID)") }
+
+        case .beginMigration(let moveID, let slots, _, let to, let sources):
+            guard to == shardID else { return }
+            receives[moveID] = Receive(moveID: moveID, slots: slots, sources: sources, startVersion: version, isCatchUp: false)
+            context.log(.info, "receiving \(slots.count) slots (move \(moveID))")
+            requestSnapshot(moveID)
 
         case .transfer(let moveID, let slots, let from, let to):
             if from == shardID {
-                changeOwnership(at: version) { $0.subtract(slots) }
+                owned.subtract(slots)
                 store.drop(slots: slots)
             }
             if to == shardID {
                 if let r = receives.removeValue(forKey: moveID), r.installedThrough != nil {
-                    changeOwnership(at: version) { $0.formUnion(slots) }
+                    owned.formUnion(slots)
                 } else {
-                    // We were not ready, so our copy is incomplete. Resync.
-                    env.log(.warning, "\(endpoint): transfer \(moveID) arrived before snapshot installed; resyncing")
-                    let shard = shardID
-                    resetState()
-                    shardID = shard
-                    sendJoin()
+                    // We weren't ready (the controller waits for us, so we must have lost
+                    // our copy): retire this tag and let the controller re-replicate.
+                    wipe("transfer \(moveID) arrived before our copy was installed")
                 }
             }
 
-        case .gainEmpty(let shard, let slots):
-            guard shard == shardID else { return }
-            changeOwnership(at: version) { $0.formUnion(slots) }
+        case .abortMigration(let moveID, _):
+            if let r = receives.removeValue(forKey: moveID) {
+                store.drop(slots: r.slots.subtracting(owned))
+            }
+
+        case .reassignSlots(let slots, let to):
+            if to == shardID { owned.formUnion(slots) }
+
+        case .removeShard, .snapshot:
+            break
         }
     }
 
     // MARK: Snapshots (data movement)
 
     private func requestSnapshot(_ moveID: UInt64) {
-        guard var r = receives[moveID], !r.sources.isEmpty else { return }
+        guard var r = receives[moveID], !r.sources.isEmpty, r.installedThrough == nil else { return }
         let source = r.sources[r.snapshotAttempt % r.sources.count]
         let rid = nextRid
         nextRid += 1
+        snapshotRequests[rid] = moveID
         r.snapshotRid = rid
         r.snapshotItems = []
         receives[moveID] = r
-        env.send(.fetchSnapshot(rid: rid, slots: r.slots, minVersion: r.startVersion), to: source)
-        env.schedule(after: config.snapshotTimeout) { [weak self] in
+        context.send(.fetchSnapshot(rid: rid, slots: r.slots, minVersion: r.startVersion), to: source)
+        context.schedule(after: config.snapshotTimeout) { [weak self] in
             guard let self, var r = self.receives[moveID], r.snapshotRid == rid, r.installedThrough == nil else { return }
-            self.env.log(.warning, "\(self.endpoint): snapshot from \(source) timed out; retrying")
+            self.context.log(.warning, "snapshot from \(source) timed out; retrying")
             r.snapshotAttempt += 1
             self.receives[moveID] = r
             self.requestSnapshot(moveID)
         }
     }
 
-    private func handleSnapshotChunk(rid: UInt64, chunk: SnapshotChunk, from: Endpoint) {
-        guard let id = receives.keys.sorted().first(where: { receives[$0]!.snapshotRid == rid }),
-              var r = receives[id], r.installedThrough == nil else { return }
+    private func handleSnapshotChunk(rid: UInt64, chunk: SnapshotChunk) {
+        guard let id = snapshotRequests[rid], var r = receives[id], r.snapshotRid == rid, r.installedThrough == nil else { return }
         if chunk.version == 0 {
-            // Source refused (doesn't own the slots); try the next one shortly.
+            // The source refused (not an active owner); try the next one shortly.
+            snapshotRequests[rid] = nil
             r.snapshotAttempt += 1
             r.snapshotRid = 0
             receives[id] = r
-            env.schedule(after: 50_000) { [weak self] in self?.requestSnapshot(id) }
+            context.schedule(after: 50_000) { [weak self] in self?.requestSnapshot(id) }
             return
         }
         r.snapshotItems.append(contentsOf: chunk.items)
         guard chunk.done else { receives[id] = r; return }
+        snapshotRequests[rid] = nil
 
-        // Install the snapshot, then replay buffered mutations newer than it.
         for item in r.snapshotItems { store.install(item) }
-        for (stamp, m) in r.buffer where stamp.version > chunk.version {
-            store.apply(m, stamp: stamp)
-        }
+        for (stamp, m) in r.buffer where stamp.version > chunk.version { store.apply(m, stamp: stamp) }
         r.buffer = []
         r.snapshotItems = []
-        r.installedThrough = chunk.version
-        env.log(.info, "\(endpoint): installed snapshot for move \(id) at \(chunk.version) (catchUp=\(r.isCatchUp))")
+        r.installedThrough = chunk.version <= applied ? 0 : chunk.version
+        receives[id] = r
+        context.log(.info, "installed snapshot for move \(id) at \(chunk.version)")
         if r.isCatchUp {
-            receives[id] = nil
-            if chunk.version > applied {
-                // The snapshot is ahead of our batch stream; skip the overlap.
-                receives[id] = Receive(moveID: id, slots: r.slots, sources: [], startVersion: r.startVersion,
-                                       installedThrough: chunk.version, isCatchUp: true)
-            }
-            changeOwnership(at: applied) { $0.formUnion(r.slots) }
+            owned.formUnion(r.slots)
             isActive = true
-            // Snapshot data may be older than our own stream; reads below this are safe.
-        } else {
-            receives[id] = r
         }
-        env.send(.moveReady(moveID: id, coordinatorEpoch: coordinatorEpoch), to: coordinator)
+        if !dbInfo.clusterController.isEmpty {
+            context.send(.moveReady(moveID: id, tag: tag), to: dbInfo.clusterController)
+        }
         wakeWaiters()
     }
 
     private func handleFetchSnapshot(rid: UInt64, slots: SlotSet, minVersion: Version, from: Endpoint) {
         if applied < minVersion {
-            wait(for: minVersion, needsCommitted: false, then: { [weak self] in
+            wait(for: minVersion, then: { [weak self] in
                 self?.handleFetchSnapshot(rid: rid, slots: slots, minVersion: minVersion, from: from)
             }, expire: { [weak self] in
-                self?.env.send(.snapshotChunk(rid: rid, SnapshotChunk(version: 0, items: [], done: true)), to: from)
+                self?.context.send(.snapshotChunk(rid: rid, SnapshotChunk(version: 0, items: [], done: true)), to: from)
             })
             return
         }
-        guard isActive, slots.subtracting(owned).isEmpty else {
-            env.send(.snapshotChunk(rid: rid, SnapshotChunk(version: 0, items: [], done: true)), to: from)
+        guard isActive, tag != 0, slots.subtracting(owned).isEmpty else {
+            context.send(.snapshotChunk(rid: rid, SnapshotChunk(version: 0, items: [], done: true)), to: from)
             return
         }
         let items = store.extract(slots: slots)
@@ -385,46 +350,58 @@ public final class StorageServer: ServerNode {
         var i = 0
         repeat {
             let end = min(items.count, i + size)
-            env.send(.snapshotChunk(rid: rid, SnapshotChunk(version: applied, items: Array(items[i..<end]), done: end == items.count)), to: from)
+            context.send(.snapshotChunk(rid: rid, SnapshotChunk(version: applied, items: Array(items[i..<end]), done: end == items.count)), to: from)
             i = end
         } while i < items.count
     }
 
+    // MARK: Messages
+
+    public func receive(_ message: Message, from: Endpoint) {
+        switch message {
+        case .read(let rid, let key, let version):
+            handleRead(rid: rid, key: key, version: version, from: from)
+        case .readRange(let rid, let range, let version, let limit):
+            handleRange(rid: rid, range: range, version: version, limit: Int(limit), from: from)
+        case .fetchSnapshot(let rid, let slots, let minVersion):
+            handleFetchSnapshot(rid: rid, slots: slots, minVersion: minVersion, from: from)
+        case .snapshotChunk(let rid, let chunk):
+            handleSnapshotChunk(rid: rid, chunk: chunk)
+        case .getStorageStats(let rid):
+            context.send(.storageStatsReply(rid: rid, stats), to: from)
+        default:
+            if let rid = message.rid, !message.isReply { context.send(.errorReply(rid: rid, .invalidRequest), to: from) }
+        }
+    }
+
     // MARK: Reads
 
-    /// Runs `run` once `version` is applied (and, if `needsCommitted`, known committed);
-    /// runs `expire` instead if that takes longer than `readWaitTimeout`.
-    private func wait(for version: Version, needsCommitted: Bool, then run: @escaping () -> Void, expire: @escaping () -> Void) {
+    private func wait(for version: Version, then run: @escaping () -> Void, expire: @escaping () -> Void) {
         let id = nextWaiterID
         nextWaiterID += 1
-        waiters.append(Waiter(id: id, version: version, needsCommitted: needsCommitted, run: run, expire: expire))
-        env.schedule(after: config.readWaitTimeout) { [weak self] in
+        waiters.append(Waiter(id: id, version: version, run: run, expire: expire))
+        context.schedule(after: config.readWaitTimeout) { [weak self] in
             guard let self, let idx = self.waiters.firstIndex(where: { $0.id == id }) else { return }
             let w = self.waiters.remove(at: idx)
             w.expire()
         }
     }
 
-    private func isReady(_ w: Waiter) -> Bool {
-        w.version <= applied && (!w.needsCommitted || w.version <= committed)
-    }
-
     private func wakeWaiters() {
         guard !waiters.isEmpty else { return }
-        let ready = waiters.filter(isReady)
+        let ready = waiters.filter { $0.version <= applied }
         guard !ready.isEmpty else { return }
-        waiters.removeAll(where: isReady)
+        waiters.removeAll { $0.version <= applied }
         for w in ready { w.run() }
     }
 
     private enum ReadCheck { case ok, error(ErrorCode), deferred }
 
-    /// Common checks for reads: version bounds, membership, and waiting for the version.
     private func checkRead(version: Version, retry: @escaping () -> Void, onExpire: @escaping () -> Void) -> ReadCheck {
-        if shardID < 0 || awaitingFirstBatch { return .error(.wrongShard) }
+        if tag == 0 || shardID < 0 { return .error(.wrongShard) }
         if version < oldestReadable { return .error(.transactionTooOld) }
-        if version > applied || version > committed {
-            wait(for: version, needsCommitted: true, then: retry, expire: onExpire)
+        if version > applied {
+            wait(for: version, then: retry, expire: onExpire)
             return .deferred
         }
         return .ok
@@ -434,21 +411,21 @@ public final class StorageServer: ServerNode {
         let check = checkRead(version: version, retry: { [weak self] in
             self?.handleRead(rid: rid, key: key, version: version, from: from)
         }, onExpire: { [weak self] in
-            self?.env.send(.errorReply(rid: rid, .futureVersion), to: from)
+            self?.context.send(.errorReply(rid: rid, .futureVersion), to: from)
         })
         switch check {
         case .deferred: return
-        case .error(let e): env.send(.errorReply(rid: rid, e), to: from); return
+        case .error(let e): context.send(.errorReply(rid: rid, e), to: from); return
         case .ok: break
         }
         guard owned.contains(Slots.slot(for: key)) else {
-            env.send(.errorReply(rid: rid, .wrongShard), to: from)
+            context.send(.errorReply(rid: rid, .wrongShard), to: from)
             return
         }
         if let v = store.get(key, at: version), let value = v.visibleValue(at: version) {
-            env.send(.readReply(rid: rid, value: value, stamp: v.stamp), to: from)
+            context.send(.readReply(rid: rid, value: value, stamp: v.stamp), to: from)
         } else {
-            env.send(.readReply(rid: rid, value: nil, stamp: .zero), to: from)
+            context.send(.readReply(rid: rid, value: nil, stamp: .zero), to: from)
         }
     }
 
@@ -456,15 +433,17 @@ public final class StorageServer: ServerNode {
         let check = checkRead(version: version, retry: { [weak self] in
             self?.handleRange(rid: rid, range: range, version: version, limit: limit, from: from)
         }, onExpire: { [weak self] in
-            self?.env.send(.errorReply(rid: rid, .futureVersion), to: from)
+            self?.context.send(.errorReply(rid: rid, .futureVersion), to: from)
         })
         switch check {
         case .deferred: return
-        case .error(let e): env.send(.errorReply(rid: rid, e), to: from); return
+        case .error(let e): context.send(.errorReply(rid: rid, e), to: from); return
         case .ok: break
         }
         let owned = self.owned
-        let result = store.range(range, at: version, limit: max(1, limit)) { owned.contains(Slots.slot(for: $0)) }
-        env.send(.rangeReply(rid: rid, entries: result.entries, more: result.more, servedSlots: owned), to: from)
+        let result = store.range(range, at: version, limit: max(1, limit)) {
+            owned.contains(Slots.slot(for: $0)) && !SystemKeys.isSystem($0)
+        }
+        context.send(.rangeReply(rid: rid, entries: result.entries, more: result.more, servedSlots: owned), to: from)
     }
 }

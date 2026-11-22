@@ -32,6 +32,9 @@ public final class Transaction: Sendable {
         var writeConflictKeys: Set<Bytes> = []
         var committedStamp: Versionstamp?
         var committed = false
+        var idempotencyID: Bytes?
+        var attemptID: UInt64 = 0
+        var idempotencyRetention: UInt32 = 0
     }
 
     let client: ClusterClient
@@ -72,6 +75,28 @@ public final class Transaction: Sendable {
     }
 
     var isReadVersionPinned: Bool { state.withLock { $0.readVersionPinned } }
+
+    /// Marks this transaction as an attempt of a logical operation with id `id`.
+    func makeIdempotent(id: Bytes, attemptID: UInt64, retention: UInt32) {
+        state.withLock {
+            $0.idempotencyID = id
+            $0.attemptID = attemptID
+            $0.idempotencyRetention = retention
+        }
+    }
+
+    /// The operation's idempotency record at this transaction's read version, if an
+    /// earlier attempt committed.
+    func idempotencyRecord() async throws -> (stamp: Versionstamp, attemptID: UInt64)? {
+        guard let id = state.withLock({ $0.idempotencyID }) else { return nil }
+        let version = try await readVersion()
+        let (value, _) = try await client.read(SystemKeys.idempotency(id), at: version)
+        return value.flatMap(SystemKeys.parseIdempotencyValue)
+    }
+
+    private func checkUserKey(_ key: Bytes) {
+        precondition(!SystemKeys.isSystem(key), "keys starting with 0xFF are reserved for the system")
+    }
 
     /// The versionstamp assigned at commit (nil before commit, or for read-only transactions).
     public var committedVersionstamp: Versionstamp? { state.withLock { $0.committedStamp } }
@@ -161,6 +186,7 @@ public final class Transaction: Sendable {
     /// Sets a key to raw bytes. A `ttl` (seconds) makes the value expire.
     public func set(_ key: some CacheKey, bytes value: Bytes, ttl: Double? = nil) {
         let k = key.cacheKeyBytes
+        checkUserKey(k)
         let ttlMicros = ttl.map { UInt64(max(0, $0) * 1_000_000) } ?? 0
         state.withLock { s in
             s.writes[k] = .value(value)
@@ -177,6 +203,7 @@ public final class Transaction: Sendable {
     /// Deletes a key.
     public func clear(_ key: some CacheKey) {
         let k = key.cacheKeyBytes
+        checkUserKey(k)
         state.withLock { s in
             s.writes[k] = .value(nil)
             s.mutations.append(.clear(key: k))
@@ -188,6 +215,7 @@ public final class Transaction: Sendable {
     /// reading it, so concurrent adds never conflict with each other.
     public func add(_ key: some CacheKey, _ delta: Int64) {
         let k = key.cacheKeyBytes
+        checkUserKey(k)
         state.withLock { s in
             switch s.writes[k] {
             case .value(let v)?:
@@ -256,7 +284,10 @@ public final class Transaction: Sendable {
             readConflictKeys: s.readConflictKeys.sorted(by: bytesLess),
             readConflictRanges: s.readConflictRanges,
             writeConflictKeys: s.writeConflictKeys.sorted(by: bytesLess),
-            mutations: s.mutations)
+            mutations: s.mutations,
+            idempotencyID: s.idempotencyID,
+            idempotencyRetention: s.idempotencyRetention,
+            attemptID: s.attemptID)
         let stamp = try await client.commit(request)
         state.withLock {
             $0.committed = true

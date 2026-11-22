@@ -76,9 +76,9 @@ public struct NetworkProfile: Sendable {
     public init() {}
 }
 
-/// A discrete-event simulation of a SwiftCache cluster: one coordinator, any number of
-/// storage servers and clients, a simulated network, a virtual clock and fault injection.
-/// Given the same seed it always produces exactly the same execution.
+/// A discrete-event simulation of a SwiftCache cluster: coordinators, stateless, log and
+/// storage processes, any number of clients, a simulated network, a virtual clock and
+/// fault injection. Given the same seed it always produces exactly the same execution.
 public final class Simulator: @unchecked Sendable {
     public private(set) var now: UInt64 = 1_000_000_000
     public var random: SimRandom
@@ -100,20 +100,25 @@ public final class Simulator: @unchecked Sendable {
 
     // Processes.
     final class Process {
-        let endpoint: Endpoint
-        var node: (any ServerNode)?
+        let address: Endpoint
+        let processClass: ProcessClass
+        let isCoordinator: Bool
+        var host: ProcessHost?
         var incarnation: UInt64 = 0
         var alive = true
-        let make: (any NodeEnvironment) -> any ServerNode
-        var env: SimNodeEnvironment?
-        init(endpoint: Endpoint, make: @escaping (any NodeEnvironment) -> any ServerNode) {
-            self.endpoint = endpoint
-            self.make = make
+        /// Survives restarts (only coordinators use it).
+        let disk = SimDisk()
+        init(address: Endpoint, processClass: ProcessClass, isCoordinator: Bool) {
+            self.address = address
+            self.processClass = processClass
+            self.isCoordinator = isCoordinator
         }
     }
     private(set) var processes: [Endpoint: Process] = [:]
-    public let coordinatorEndpoint: Endpoint = "coordinator"
-    public private(set) var storageEndpoints: [Endpoint] = []
+    public private(set) var coordinatorAddresses: [Endpoint] = []
+    public private(set) var storageAddresses: [Endpoint] = []
+    public private(set) var logAddresses: [Endpoint] = []
+    public private(set) var statelessAddresses: [Endpoint] = []
 
     // Clients.
     final class ClientEndpoint {
@@ -122,10 +127,11 @@ public final class Simulator: @unchecked Sendable {
     private var clients: [Endpoint: ClientEndpoint] = [:]
     private var nextRid: UInt64 = 1
 
-    // Network state: per-directed-link connection epoch and last delivery time (FIFO).
+    // Network state.
     private struct Link: Hashable { var from: Endpoint; var to: Endpoint }
-    private var linkEpoch: [Link: UInt64] = [:]
     private var linkLastDelivery: [Link: UInt64] = [:]
+    /// Bumped whenever a process's connections break (kill, restart, partition).
+    private var connectionEpoch: [Endpoint: UInt64] = [:]
     private var partitionedUntil: [Endpoint: UInt64] = [:]
 
     // Observability.
@@ -144,113 +150,129 @@ public final class Simulator: @unchecked Sendable {
 
     // MARK: Building the cluster
 
-    public func addCoordinator() {
-        let config = self.config
-        let ep = coordinatorEndpoint
-        addProcess(ep) { env in Coordinator(endpoint: ep, config: config, env: env) }
+    /// Adds `n` coordinator processes (stateless class). Call before adding anything else.
+    public func addCoordinators(_ n: Int) {
+        let added = (0..<n).map { _ in addProcess(.stateless, coordinator: true, boot: false) }
+        for a in added { boot(processes[a]!) }
     }
 
+    /// Adds a process.
     @discardableResult
-    public func addStorageServer() -> Endpoint {
-        let ep = "storage-\(storageEndpoints.count)"
-        storageEndpoints.append(ep)
-        let config = self.config
-        let coord = coordinatorEndpoint
-        addProcess(ep) { env in StorageServer(endpoint: ep, coordinator: coord, config: config, env: env) }
-        return ep
+    public func addProcess(_ cls: ProcessClass, coordinator: Bool = false, boot shouldBoot: Bool = true) -> Endpoint {
+        let prefix: String
+        switch cls {
+        case .storage: prefix = "storage-\(storageAddresses.count)"
+        case .log: prefix = "log-\(logAddresses.count)"
+        case .stateless: prefix = coordinator ? "coord-\(coordinatorAddresses.count)" : "stateless-\(statelessAddresses.count)"
+        }
+        let address = "\(prefix):4500"
+        switch cls {
+        case .storage: storageAddresses.append(address)
+        case .log: logAddresses.append(address)
+        case .stateless: statelessAddresses.append(address)
+        }
+        if coordinator { coordinatorAddresses.append(address) }
+        let p = Process(address: address, processClass: cls, isCoordinator: coordinator)
+        processes[address] = p
+        if shouldBoot { boot(p) }
+        return address
     }
 
-    private func addProcess(_ ep: Endpoint, make: @escaping (any NodeEnvironment) -> any ServerNode) {
-        let p = Process(endpoint: ep, make: make)
-        processes[ep] = p
-        boot(p)
-    }
+    public var coordinatorEndpoints: [Endpoint] { coordinatorAddresses.map(ServerProcess.coordinatorEndpoint) }
 
     private func boot(_ p: Process) {
         p.incarnation += 1
         p.alive = true
-        let env = SimNodeEnvironment(sim: self, endpoint: p.endpoint, incarnation: p.incarnation)
-        p.env = env
-        let node = p.make(env)
-        p.node = node
-        schedule(after: 0) { node.start() }
+        let env = SimProcessEnvironment(sim: self, address: p.address, incarnation: p.incarnation, disk: p.disk)
+        let host = ServerProcess.make(env: env, processClass: p.processClass, isCoordinator: p.isCoordinator,
+                                      coordinators: coordinatorEndpoints, config: config)
+        p.host = host
+        schedule(after: 0) { host.start() }
     }
 
-    /// The live coordinator object (for inspection in tests/checkers).
-    public var coordinator: Coordinator? {
-        guard let p = processes[coordinatorEndpoint], p.alive else { return nil }
-        return p.node as? Coordinator
+    public var allAddresses: [Endpoint] { processes.keys.sorted() }
+
+    public func host(_ address: Endpoint) -> ProcessHost? {
+        guard let p = processes[address], p.alive else { return nil }
+        return p.host
     }
 
-    public func storageServer(_ ep: Endpoint) -> StorageServer? {
-        guard let p = processes[ep], p.alive else { return nil }
-        return p.node as? StorageServer
+    public func isAlive(_ address: Endpoint) -> Bool { processes[address]?.alive ?? false }
+
+    /// The cluster controller that is currently running a recovered generation, if any.
+    public var controller: ClusterController? {
+        for a in allAddresses {
+            if let cc = host(a)?.role(ClusterController.self), !cc.context.stopped { return cc }
+        }
+        return nil
     }
 
-    public func isAlive(_ ep: Endpoint) -> Bool { processes[ep]?.alive ?? false }
+    public func roles<T: Role>(_ type: T.Type) -> [T] {
+        allAddresses.compactMap { host($0) }.flatMap { h in h.roles.keys.sorted().compactMap { h.roles[$0] as? T } }
+    }
 
     // MARK: Faults
 
-    /// Kills a process: its memory is lost and all its connections break.
-    public func kill(_ ep: Endpoint) {
-        guard let p = processes[ep], p.alive else { return }
+    /// Kills a process: its memory is lost (not its disk) and all its connections break.
+    public func kill(_ address: Endpoint) {
+        guard let p = processes[address], p.alive else { return }
         p.alive = false
-        p.node = nil
-        p.env = nil
-        breakConnections(of: ep)
-        trace("KILL \(ep)")
+        p.host = nil
+        breakConnections(of: address)
+        trace("KILL \(address)")
     }
 
-    /// Restarts a killed process with empty state.
-    public func restart(_ ep: Endpoint) {
-        guard let p = processes[ep], !p.alive else { return }
-        breakConnections(of: ep)
+    /// Restarts a killed process with empty memory (its disk is kept).
+    public func restart(_ address: Endpoint) {
+        guard let p = processes[address], !p.alive else { return }
+        breakConnections(of: address)
         boot(p)
-        trace("RESTART \(ep)")
+        trace("RESTART \(address)")
+    }
+
+    /// Crashes a single role, leaving the rest of its process running.
+    public func killRole(_ endpoint: Endpoint) {
+        guard let h = host(endpoint.processAddress), h.roles[endpoint] != nil else { return }
+        h.remove(endpoint)
+        trace("KILL ROLE \(endpoint)")
     }
 
     /// Isolates a process from the network for `duration` µs (connections break).
-    public func partition(_ ep: Endpoint, for duration: UInt64) {
-        partitionedUntil[ep] = now + duration
-        breakConnections(of: ep)
-        trace("PARTITION \(ep) for \(duration / 1000)ms")
+    public func partition(_ address: Endpoint, for duration: UInt64) {
+        partitionedUntil[address] = max(partitionedUntil[address] ?? 0, now + duration)
+        breakConnections(of: address)
+        trace("PARTITION \(address) for \(duration / 1000)ms")
         schedule(after: duration) { [weak self] in
-            guard let self else { return }
-            if let until = self.partitionedUntil[ep], until <= self.now {
-                self.partitionedUntil[ep] = nil
-                self.breakConnections(of: ep)
-                self.trace("HEAL \(ep)")
-            }
+            guard let self, let until = self.partitionedUntil[address], until <= self.now else { return }
+            self.partitionedUntil[address] = nil
+            self.breakConnections(of: address)
+            self.trace("HEAL \(address)")
         }
     }
 
-    public func isPartitioned(_ ep: Endpoint) -> Bool {
-        if let until = partitionedUntil[ep] { return until > now }
+    public func isPartitioned(_ address: Endpoint) -> Bool {
+        if let until = partitionedUntil[address] { return until > now }
         return false
     }
 
-    private func breakConnections(of ep: Endpoint) {
-        for link in linkEpoch.keys where link.from == ep || link.to == ep {
-            linkEpoch[link]! += 1
-        }
-        // Links not yet in the table start at 0; bump them lazily by recording a marker.
-        brokenAt[ep] = (brokenAt[ep] ?? 0) + 1
+    private func breakConnections(of address: Endpoint) {
+        connectionEpoch[address, default: 0] += 1
     }
-    private var brokenAt: [Endpoint: UInt64] = [:]
 
-    private func currentEpoch(_ link: Link) -> UInt64 {
-        (linkEpoch[link] ?? 0) &+ (brokenAt[link.from] ?? 0) &* 1_000_003 &+ (brokenAt[link.to] ?? 0) &* 7_919
+    private func epoch(_ link: Link) -> (UInt64, UInt64) {
+        (connectionEpoch[link.from] ?? 0, connectionEpoch[link.to] ?? 0)
     }
 
     // MARK: Network
 
     func send(_ message: Message, from: Endpoint, to: Endpoint) {
-        if isPartitioned(from) || isPartitioned(to) { return }
-        if let p = processes[from], !p.alive { return }
-        let link = Link(from: from, to: to)
-        if linkEpoch[link] == nil { linkEpoch[link] = 0 }
-        let epoch = currentEpoch(link)
+        let src = from.processAddress, dst = to.processAddress
+        if isPartitioned(src) || isPartitioned(dst) { return }
+        if let p = processes[src], !p.alive { return }
+        let link = Link(from: src, to: dst)
+        let e = epoch(link)
         var latency = network.minLatency + random.below(network.maxLatency - network.minLatency + 1)
+        if src == dst { latency = 1 }
         if random.chance(network.spikeProbability) { latency += random.below(network.spikeLatency) }
         let at = max(now + latency, (linkLastDelivery[link] ?? 0) + 1)
         linkLastDelivery[link] = at
@@ -268,7 +290,7 @@ public final class Simulator: @unchecked Sendable {
         }
         scheduleAt(at) { [weak self] in
             guard let self else { return }
-            guard self.currentEpoch(link) == epoch, !self.isPartitioned(from), !self.isPartitioned(to) else { return }
+            guard self.epoch(link) == e, !self.isPartitioned(src), !self.isPartitioned(dst) else { return }
             self.deliver(payload, from: from, to: to)
         }
     }
@@ -284,8 +306,8 @@ public final class Simulator: @unchecked Sendable {
             }
             return
         }
-        guard let p = processes[to], p.alive, let node = p.node else { return }
-        node.receive(message, from: from)
+        guard let p = processes[to.processAddress], p.alive, let host = p.host else { return }
+        host.receive(message, from: from, to: to)
     }
 
     // MARK: Scheduling
@@ -315,8 +337,7 @@ public final class Simulator: @unchecked Sendable {
         if now < time { now = time }
     }
 
-    /// Runs until `condition` is true or `timeout` µs of virtual time pass. Returns whether
-    /// the condition was met.
+    /// Runs until `condition` is true or `timeout` µs of virtual time pass.
     @discardableResult
     public func run(for timeout: UInt64, until condition: () -> Bool) -> Bool {
         let deadline = now + timeout
@@ -336,7 +357,7 @@ public final class Simulator: @unchecked Sendable {
 
     /// Creates a client endpoint and its transport.
     public func makeClientTransport(name: String? = nil) -> SimClientTransport {
-        let ep = name ?? "client-\(clients.count)"
+        let ep = "client:" + (name ?? "\(clients.count)")
         clients[ep] = ClientEndpoint()
         return SimClientTransport(sim: self, endpoint: ep)
     }
@@ -361,7 +382,7 @@ public final class Simulator: @unchecked Sendable {
 
     // MARK: Logging, tracing, failures
 
-    func nodeLog(_ endpoint: Endpoint, _ level: LogLevel, _ message: String) {
+    func nodeLog(_ level: LogLevel, _ message: String) {
         appendLog("\(timestamp) [\(level)] \(message)")
     }
 
@@ -378,12 +399,8 @@ public final class Simulator: @unchecked Sendable {
 
     public var timestamp: String {
         let t = now - 1_000_000_000
-        return "t=\(t / 1_000_000).\(String(format3(t % 1_000_000 / 1000)))s"
-    }
-
-    private func format3(_ v: UInt64) -> String {
-        let s = String(v)
-        return String(repeating: "0", count: max(0, 3 - s.count)) + s
+        let ms = String(t % 1_000_000 / 1000)
+        return "t=\(t / 1_000_000).\(String(repeating: "0", count: 3 - ms.count) + ms)s"
     }
 
     private func mixTrace(_ s: String) {
@@ -404,29 +421,38 @@ public final class Simulator: @unchecked Sendable {
     public var pendingEvents: Int { events.count }
 }
 
-/// The `NodeEnvironment` the simulator gives each server process.
-final class SimNodeEnvironment: NodeEnvironment {
-    unowned let sim: Simulator
-    let endpoint: Endpoint
-    let incarnation: UInt64
+/// A simulated disk: survives process restarts.
+final class SimDisk: Disk {
+    private var values: [String: Bytes] = [:]
+    func read(_ key: String) -> Bytes? { values[key] }
+    func write(_ key: String, _ value: Bytes) { values[key] = value }
+}
 
-    init(sim: Simulator, endpoint: Endpoint, incarnation: UInt64) {
+/// The `ProcessEnvironment` the simulator gives each process.
+final class SimProcessEnvironment: ProcessEnvironment {
+    unowned let sim: Simulator
+    let address: Endpoint
+    let incarnation: UInt64
+    let disk: any Disk
+
+    init(sim: Simulator, address: Endpoint, incarnation: UInt64, disk: any Disk) {
         self.sim = sim
-        self.endpoint = endpoint
+        self.address = address
         self.incarnation = incarnation
+        self.disk = disk
     }
 
     private var isCurrent: Bool {
-        guard let p = sim.processes[endpoint] else { return false }
+        guard let p = sim.processes[address] else { return false }
         return p.alive && p.incarnation == incarnation
     }
 
     var now: UInt64 { sim.now }
     var versionClock: UInt64 { sim.now }
 
-    func send(_ message: Message, to endpoint: Endpoint) {
+    func send(_ message: Message, from: Endpoint, to: Endpoint) {
         guard isCurrent else { return }
-        sim.send(message, from: self.endpoint, to: endpoint)
+        sim.send(message, from: from, to: to)
     }
 
     func schedule(after micros: UInt64, _ action: @escaping () -> Void) {
@@ -440,7 +466,7 @@ final class SimNodeEnvironment: NodeEnvironment {
 
     func log(_ level: LogLevel, _ message: @autoclosure () -> String) {
         guard level >= .info else { return }
-        sim.nodeLog(endpoint, level, message())
+        sim.nodeLog(level, message())
     }
 }
 

@@ -3,11 +3,11 @@ import Foundation
 import SwiftCache
 
 struct Connection: ParsableArguments {
-    @Option(help: "Coordinator endpoint host:port (default: $SWIFTCACHE_COORDINATOR or localhost:7400).")
-    var coordinator: String = ProcessInfo.processInfo.environment["SWIFTCACHE_COORDINATOR"] ?? "localhost:7400"
+    @Option(help: "Comma-separated coordinator addresses (default: $SWIFTCACHE_CLUSTER or localhost:4500).")
+    var cluster: String = ProcessInfo.processInfo.environment["SWIFTCACHE_CLUSTER"] ?? "localhost:4500"
 
     func connect() async throws -> Database {
-        try await Database.connect(coordinator: coordinator)
+        try await Database.connect(cluster: cluster)
     }
 }
 
@@ -28,22 +28,29 @@ struct Status: AsyncParsableCommand {
     func run() async throws {
         let db = try await conn.connect()
         let s = try await db.status()
-        print("phase: \(s.phase)   epoch: \(s.coordinatorEpoch)   replication: \(s.replicationFactor)")
-        print("versions: latest=\(s.latestVersion) committed=\(s.committedVersion)")
-        print("commits: \(s.commitsTotal)   conflicts: \(s.conflictsTotal)")
+        print("phase: \(s.phase)   generation: \(s.generation)   recoveries (this controller): \(s.recoveries)   replication: \(s.replicationFactor)")
+        print("controller: \(s.clusterController)")
+        print("master:     \(s.master)")
+        print("proxies:    \(s.proxies.joined(separator: ", "))")
+        print("resolvers:  \(s.resolvers.joined(separator: ", "))")
+        print("logs:       \(s.tlogs.joined(separator: ", "))")
         var counts: [Int32: Int] = [:]
         for o in s.topology.slotOwner { counts[o, default: 0] += 1 }
         print("shards:")
         for shard in s.topology.shards {
             print("  shard \(shard.id): \(counts[shard.id] ?? 0) slots, replicas \(shard.replicas)")
         }
-        print("servers:")
-        for server in s.servers {
-            var line = "  \(server.endpoint)  shard=\(server.shardID)  \(server.state)"
-            if stats, let st = try? await db.storageStats(server.endpoint) {
-                line += "  keys=\(st.keyCount) versions=\(st.versionCount) bytes≈\(st.approximateBytes) applied=\(st.appliedVersion)"
+        print("storage:")
+        for line in s.storage {
+            var out = "  " + line
+            if stats, let ep = line.split(separator: " ").first, let st = try? await db.storageStats(String(ep)) {
+                out += "  keys=\(st.keyCount) versions=\(st.versionCount) bytes≈\(st.approximateBytes)"
             }
-            print(line)
+            print(out)
+        }
+        print("processes:")
+        for p in s.processes {
+            print("  \(p.address)  \(p.processClass)  \(p.alive ? "alive" : "DEAD")  roles: \(p.roles.map { $0.split(separator: "#").last.map(String.init) ?? $0 }.joined(separator: " "))")
         }
         for m in s.movesInProgress { print("moving: \(m)") }
     }
@@ -156,6 +163,7 @@ struct WaitReady: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "wait-ready", abstract: "Wait until the cluster is running with N fully-replicated shards and no data movement.")
     @OptionGroup var conn: Connection
     @Option var shards = 1
+    @Option(help: "Also wait until the transaction-system generation is at least this.") var minGeneration: UInt64 = 0
     @Option var timeout: Double = 120
 
     func run() async throws {
@@ -165,8 +173,8 @@ struct WaitReady: AsyncParsableCommand {
             if let db = try? await conn.connect(), let s = try? await db.status() {
                 let full = s.topology.shards.filter { $0.replicas.count >= Int(s.replicationFactor) }
                 let allAssigned = !s.topology.slotOwner.contains(-1)
-                last = "phase=\(s.phase) shards=\(s.topology.shards.count) fullyReplicated=\(full.count) moves=\(s.movesInProgress.count)"
-                if s.phase == "running" && full.count >= shards && s.topology.shards.count == full.count
+                last = "phase=\(s.phase) generation=\(s.generation) shards=\(s.topology.shards.count) fullyReplicated=\(full.count) moves=\(s.movesInProgress.count)"
+                if s.phase == "running" && s.generation >= minGeneration && full.count >= shards && s.topology.shards.count == full.count
                     && s.movesInProgress.isEmpty && allAssigned {
                     // Balanced?
                     var counts: [Int32: Int] = [:]

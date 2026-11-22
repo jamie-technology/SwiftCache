@@ -2,13 +2,18 @@
 #
 #   kubectl apply -f deploy/k8s/swiftcache.yaml
 #
-# Topology: one coordinator (StatefulSet of 1) and a StatefulSet of storage servers.
-# Every `replication` storage pods form one shard; scaling the storage StatefulSet by
-# `replication` pods adds a shard, and the coordinator migrates slots onto it:
+# Process layout (every pod is one SwiftCache process; the cluster assigns roles):
+#
+#   swiftcache-coordinator-{0,1,2}  coordinators (durable state on a PVC) that also host
+#                                   stateless roles: cluster controller, master, commit
+#                                   proxies, resolver. Losing one is fine; losing two
+#                                   stops recoveries (the running generation keeps going).
+#   swiftcache-log-{0,1,2}          transaction logs (a commit is on all of them).
+#   swiftcache-storage-N            storage servers; every REPLICATION pods form a shard.
+#
+# Scale capacity by adding storage pods in multiples of REPLICATION:
 #
 #   kubectl -n swiftcache scale statefulset swiftcache-storage --replicas=6
-#
-# Storage is in-memory: a shard survives losing up to replication-1 replicas at a time.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -20,90 +25,134 @@ metadata:
   name: swiftcache-config
   namespace: swiftcache
 data:
+  # The "cluster file": every process and client must agree on it.
+  CLUSTER: "swiftcache-coordinator-0.swiftcache.swiftcache.svc.cluster.local:4500,swiftcache-coordinator-1.swiftcache.swiftcache.svc.cluster.local:4500,swiftcache-coordinator-2.swiftcache.swiftcache.svc.cluster.local:4500"
   REPLICATION: "2"
+  LOGS: "3"
+  PROXIES: "2"
   MVCC_WINDOW_SECONDS: "10"
-  COORDINATOR: "swiftcache-coordinator.swiftcache.svc.cluster.local:7400"
 ---
-# Clients and storage servers reach the coordinator through this stable name. The
-# coordinator advertises exactly this endpoint, so it must match COORDINATOR above.
+# One headless service gives every pod a stable DNS name
+# (<pod>.swiftcache.swiftcache.svc.cluster.local), published before the pod is ready:
+# processes must reach each other to become ready.
 apiVersion: v1
 kind: Service
 metadata:
-  name: swiftcache-coordinator
-  namespace: swiftcache
-spec:
-  selector:
-    app.kubernetes.io/name: swiftcache
-    app.kubernetes.io/component: coordinator
-  ports:
-    - name: swiftcache
-      port: 7400
-      targetPort: 7400
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: swiftcache-coordinator
-  namespace: swiftcache
-spec:
-  serviceName: swiftcache-coordinator
-  # Exactly one: the coordinator is the cluster's sequencer. A StatefulSet guarantees
-  # at most one pod with this identity; on restart it recovers from storage reports.
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: swiftcache
-      app.kubernetes.io/component: coordinator
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: swiftcache
-        app.kubernetes.io/component: coordinator
-    spec:
-      terminationGracePeriodSeconds: 5
-      containers:
-        - name: coordinator
-          image: swiftcache:latest
-          imagePullPolicy: IfNotPresent
-          envFrom:
-            - configMapRef:
-                name: swiftcache-config
-          args:
-            - coordinator
-            - --listen=0.0.0.0:7400
-            - --advertise=$(COORDINATOR)
-            - --replication=$(REPLICATION)
-            - --mvcc-window=$(MVCC_WINDOW_SECONDS)
-          ports:
-            - containerPort: 7400
-              name: swiftcache
-          readinessProbe:
-            tcpSocket:
-              port: 7400
-            periodSeconds: 2
-          resources:
-            requests:
-              cpu: 100m
-              memory: 64Mi
-            limits:
-              memory: 512Mi
----
-# Headless service: gives every storage pod a stable DNS name, published even before
-# the pod is ready (the coordinator must reach a storage server to bring it into service).
-apiVersion: v1
-kind: Service
-metadata:
-  name: swiftcache-storage
+  name: swiftcache
   namespace: swiftcache
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: swiftcache
-    app.kubernetes.io/component: storage
   ports:
     - name: swiftcache
-      port: 7500
+      port: 4500
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: swiftcache-coordinator
+  namespace: swiftcache
+spec:
+  serviceName: swiftcache
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: swiftcache, app.kubernetes.io/component: coordinator}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: swiftcache, app.kubernetes.io/component: coordinator}
+    spec:
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        fsGroup: 10001
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway,
+           labelSelector: {matchLabels: {app.kubernetes.io/component: coordinator}}}
+      containers:
+        - name: swiftcache
+          image: swiftcache:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          envFrom:
+            - configMapRef: {name: swiftcache-config}
+          args:
+            - --class=stateless
+            - --coordinator
+            - --data-dir=/data
+            - --listen=0.0.0.0:4500
+            - --advertise=$(POD_NAME).swiftcache.swiftcache.svc.cluster.local:4500
+            - --coordinators=$(CLUSTER)
+            - --replication=$(REPLICATION)
+            - --logs=$(LOGS)
+            - --proxies=$(PROXIES)
+            - --mvcc-window=$(MVCC_WINDOW_SECONDS)
+          ports:
+            - {containerPort: 4500, name: swiftcache}
+          readinessProbe:
+            tcpSocket: {port: 4500}
+            periodSeconds: 2
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 512Mi}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 64Mi}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: swiftcache-log
+  namespace: swiftcache
+spec:
+  serviceName: swiftcache
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: swiftcache, app.kubernetes.io/component: log}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: swiftcache, app.kubernetes.io/component: log}
+    spec:
+      terminationGracePeriodSeconds: 5
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway,
+           labelSelector: {matchLabels: {app.kubernetes.io/component: log}}}
+      containers:
+        - name: swiftcache
+          image: swiftcache:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          envFrom:
+            - configMapRef: {name: swiftcache-config}
+          args:
+            - --class=log
+            - --listen=0.0.0.0:4500
+            - --advertise=$(POD_NAME).swiftcache.swiftcache.svc.cluster.local:4500
+            - --coordinators=$(CLUSTER)
+            - --replication=$(REPLICATION)
+            - --logs=$(LOGS)
+            - --proxies=$(PROXIES)
+            - --mvcc-window=$(MVCC_WINDOW_SECONDS)
+          ports:
+            - {containerPort: 4500, name: swiftcache}
+          readinessProbe:
+            tcpSocket: {port: 4500}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 1Gi}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -111,57 +160,44 @@ metadata:
   name: swiftcache-storage
   namespace: swiftcache
 spec:
-  serviceName: swiftcache-storage
+  serviceName: swiftcache
   replicas: 4
   podManagementPolicy: Parallel
   selector:
-    matchLabels:
-      app.kubernetes.io/name: swiftcache
-      app.kubernetes.io/component: storage
+    matchLabels: {app.kubernetes.io/name: swiftcache, app.kubernetes.io/component: storage}
   template:
     metadata:
-      labels:
-        app.kubernetes.io/name: swiftcache
-        app.kubernetes.io/component: storage
+      labels: {app.kubernetes.io/name: swiftcache, app.kubernetes.io/component: storage}
     spec:
       terminationGracePeriodSeconds: 5
-      # Spread replicas across nodes when there are several (no-op on single-node k3s).
       topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/component: storage
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway,
+           labelSelector: {matchLabels: {app.kubernetes.io/component: storage}}}
       containers:
-        - name: storage
+        - name: swiftcache
           image: swiftcache:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
           envFrom:
-            - configMapRef:
-                name: swiftcache-config
+            - configMapRef: {name: swiftcache-config}
           args:
-            - storage
-            - --listen=0.0.0.0:7500
-            - --advertise=$(POD_NAME).swiftcache-storage.swiftcache.svc.cluster.local:7500
-            - --coordinator=$(COORDINATOR)
+            - --class=storage
+            - --listen=0.0.0.0:4500
+            - --advertise=$(POD_NAME).swiftcache.swiftcache.svc.cluster.local:4500
+            - --coordinators=$(CLUSTER)
+            - --replication=$(REPLICATION)
+            - --logs=$(LOGS)
+            - --proxies=$(PROXIES)
             - --mvcc-window=$(MVCC_WINDOW_SECONDS)
           ports:
-            - containerPort: 7500
-              name: swiftcache
+            - {containerPort: 4500, name: swiftcache}
           readinessProbe:
-            tcpSocket:
-              port: 7500
+            tcpSocket: {port: 4500}
             periodSeconds: 2
           resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
+            requests: {cpu: 100m, memory: 128Mi}
             limits:
-              # The cache's capacity per replica. Add shards to grow the cluster's capacity.
+              # Each replica's share of the cache. Add shards to grow total capacity.
               memory: 1Gi

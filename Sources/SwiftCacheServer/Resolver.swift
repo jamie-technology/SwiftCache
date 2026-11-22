@@ -6,7 +6,7 @@ import SwiftCacheCore
 /// conflicts if any transaction that committed *after* its read version wrote a key in its
 /// read set (point keys or ranges). Transactions in one batch are resolved in order, so a
 /// transaction also conflicts with earlier transactions of the same batch.
-struct Resolver {
+struct ConflictSet {
     /// Last committed write version of each key written within the MVCC window.
     private var lastWrite: [Bytes: Version] = [:]
     /// Recent commits (version, sorted written keys), oldest first; used for range checks.
@@ -23,20 +23,26 @@ struct Resolver {
 
     /// Decides one transaction and, if it commits, records its writes at `commitVersion`.
     mutating func resolve(_ req: CommitRequest, commitVersion: Version) -> Outcome {
+        resolve(ResolveTxn(readVersion: req.readVersion, readKeys: req.readConflictKeys,
+                           readRanges: req.readConflictRanges, writeKeys: req.writeConflictKeys),
+                commitVersion: commitVersion)
+    }
+
+    mutating func resolve(_ req: ResolveTxn, commitVersion: Version) -> Outcome {
         if req.readVersion < oldestReadable { return .tooOld }
-        for key in req.readConflictKeys {
+        for key in req.readKeys {
             if let w = lastWrite[key], w > req.readVersion { return .conflict }
         }
-        if !req.readConflictRanges.isEmpty {
+        if !req.readRanges.isEmpty {
             // Walk commits newer than the read version (newest first).
             for entry in recent.elements.reversed() {
                 if entry.version <= req.readVersion { break }
-                for range in req.readConflictRanges where Self.intersects(entry.keys, range) {
+                for range in req.readRanges where Self.intersects(entry.keys, range) {
                     return .conflict
                 }
             }
         }
-        record(req.writeConflictKeys, at: commitVersion)
+        record(req.writeKeys, at: commitVersion)
         return .commit
     }
 
@@ -77,4 +83,81 @@ struct Resolver {
     }
 
     var trackedKeys: Int { lastWrite.count }
+}
+
+/// The resolver of one generation: decides conflicts for every commit batch, in version
+/// order, and relays metadata changes between commit proxies so they all route the same.
+public final class ResolverRole: Role {
+    public let context: RoleContext
+    let config: ClusterConfig
+    let spec: ResolverSpec
+
+    private var conflicts = ConflictSet()
+    private var lastVersion: Version
+    private var pending: [Version: (from: Endpoint, rid: UInt64, req: ResolveRequest)] = [:]
+    private var stateOps: [StateOps] = []
+    private var lastSeen: [UInt32: Version] = [:]
+    /// Recent replies to each proxy by version, re-sent if the proxy retries.
+    private var recentReplies: [UInt32: [(version: Version, reply: ResolveReply)]] = [:]
+
+    init(context: RoleContext, config: ClusterConfig, spec: ResolverSpec) {
+        self.context = context
+        self.config = config
+        self.spec = spec
+        self.lastVersion = spec.startVersion
+    }
+
+    public func start() {
+        // History before this generation is unknown: older read versions can't be checked.
+        conflicts.reset(rejectingReadsBefore: spec.startVersion)
+        context.ready()
+    }
+
+    public func receive(_ message: Message, from: Endpoint) {
+        guard case .resolve(let rid, let req) = message else {
+            if let rid = message.rid, !message.isReply { context.send(.errorReply(rid: rid, .invalidRequest), to: from) }
+            return
+        }
+        guard req.generation == spec.generation else {
+            context.send(.errorReply(rid: rid, .staleGeneration), to: from)
+            return
+        }
+        if req.version <= lastVersion {
+            // A retry of something already resolved.
+            if let cached = recentReplies[req.proxyIndex]?.first(where: { $0.version == req.version }) {
+                context.send(.resolveReply(rid: rid, cached.reply), to: from)
+            }
+            return
+        }
+        pending[req.prevVersion] = (from, rid, req)
+        while let next = pending.removeValue(forKey: lastVersion) {
+            resolve(next.req, rid: next.rid, from: next.from)
+        }
+    }
+
+    private func resolve(_ req: ResolveRequest, rid: UInt64, from: Endpoint) {
+        let window = req.version > config.mvccWindow ? req.version - config.mvccWindow : 0
+        conflicts.advance(oldest: max(window, spec.startVersion))
+        var verdicts: [UInt8] = []
+        verdicts.reserveCapacity(req.txns.count)
+        for txn in req.txns {
+            switch conflicts.resolve(txn, commitVersion: req.version) {
+            case .commit: verdicts.append(0)
+            case .conflict: verdicts.append(1)
+            case .tooOld: verdicts.append(2)
+            }
+        }
+        let relayed = stateOps.filter { $0.version > req.lastSeenVersion && $0.version < req.version }
+        if !req.metaOps.isEmpty { stateOps.append(StateOps(version: req.version, ops: req.metaOps)) }
+        lastSeen[req.proxyIndex] = req.version
+        lastVersion = req.version
+        // Every proxy has seen everything at or below the minimum of their positions.
+        if lastSeen.count >= Int(spec.proxyCount), let floor = lastSeen.values.min() {
+            stateOps.removeAll { $0.version <= floor }
+        }
+        let reply = ResolveReply(verdicts: verdicts, stateOps: relayed)
+        recentReplies[req.proxyIndex, default: []].append((req.version, reply))
+        if recentReplies[req.proxyIndex]!.count > 64 { recentReplies[req.proxyIndex]!.removeFirst() }
+        context.send(.resolveReply(rid: rid, reply), to: from)
+    }
 }

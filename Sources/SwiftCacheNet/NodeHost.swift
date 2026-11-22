@@ -4,40 +4,45 @@ import NIOPosix
 import SwiftCacheCore
 import SwiftCacheServer
 
-/// Runs a `ServerNode` state machine in production: one SwiftNIO event loop owns the node,
-/// its timers and all of its connections, so the node sees exactly the same
-/// single-threaded, message-at-a-time world it sees in simulation.
+/// Runs a SwiftCache process in production: one SwiftNIO event loop owns every role of
+/// the process, its timers and its connections, so roles see exactly the same
+/// single-threaded, message-at-a-time world they see in simulation.
 ///
-/// Routing: messages to servers (`host:port` endpoints) always go over a connection this
-/// node dialed (one per destination, so per-link ordering is preserved, as in the
-/// simulator). Messages to clients (`client:` endpoints) go back over the client's
-/// inbound connection.
-public final class NodeHost: NodeEnvironment, @unchecked Sendable {
-    public let endpoint: Endpoint
+/// Routing: messages to other processes go over a connection this process dialed (one
+/// per destination process, preserving per-link order as in the simulator). Messages to
+/// clients (`client:` endpoints) go back over the client's own connection.
+public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
+    public let address: Endpoint
     let group: MultiThreadedEventLoopGroup
     let loop: any EventLoop
     let startTime = NIODeadline.now()
     let logLevel: LogLevel
+    public let disk: any Disk
     // Everything below is only touched on `loop`.
-    var node: (any ServerNode)?
+    var process: (any ProcessNode)?
 
     private enum Outbound {
         case connecting([ByteBuffer])
         case ready(any Channel)
     }
     private var outbound: [Endpoint: Outbound] = [:]
-    private var inboundByEndpoint: [Endpoint: any Channel] = [:]
+    private var clientChannels: [Endpoint: any Channel] = [:]
     private var downUntil: [Endpoint: NIODeadline] = [:]
 
-    public init(endpoint: Endpoint, logLevel: LogLevel = .info) {
-        self.endpoint = endpoint
+    public init(address: Endpoint, dataDirectory: String?, logLevel: LogLevel = .info) throws {
+        self.address = address
         self.logLevel = logLevel
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.loop = group.next()
+        if let dataDirectory {
+            self.disk = try FileDisk(directory: dataDirectory)
+        } else {
+            self.disk = MemoryDisk()
+        }
     }
 
-    /// Binds `host:port`, starts the node and blocks forever.
-    public func run(bindHost: String, port: Int, makeNode: @escaping @Sendable (any NodeEnvironment) -> any ServerNode) throws -> Never {
+    /// Binds `host:port`, starts the process and blocks forever.
+    public func run(bindHost: String, port: Int, makeProcess: @escaping @Sendable (any ProcessEnvironment) -> any ProcessNode) throws -> Never {
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -48,11 +53,11 @@ public final class NodeHost: NodeEnvironment, @unchecked Sendable {
                                      onClose: { ch in self.inboundClosed(ch) })
             }
         let server = try bootstrap.bind(host: bindHost, port: port).wait()
-        log(.info, "\(endpoint) listening on \(bindHost):\(port)")
+        log(.info, "\(address) listening on \(bindHost):\(port)")
         try loop.submit { [self] in
-            let node = makeNode(self)
-            self.node = node
-            node.start()
+            let p = makeProcess(self)
+            self.process = p
+            p.start()
         }.wait()
         try server.closeFuture.wait()
         exit(1)
@@ -60,27 +65,16 @@ public final class NodeHost: NodeEnvironment, @unchecked Sendable {
 
     // MARK: Inbound
 
-    private var channelEndpoint: [ObjectIdentifier: Endpoint] = [:]
-
     private func inbound(_ channel: any Channel, _ frame: Frame) {
-        switch frame {
-        case .hello(let ep):
-            channelEndpoint[ObjectIdentifier(channel)] = ep
-            inboundByEndpoint[ep] = channel
-        case .message(let m):
-            guard let from = channelEndpoint[ObjectIdentifier(channel)] else { return }
-            node?.receive(m, from: from)
-        }
+        if frame.from.hasPrefix("client:") { clientChannels[frame.from] = channel }
+        process?.receive(frame.message, from: frame.from, to: frame.to)
     }
 
     private func inboundClosed(_ channel: any Channel) {
-        if let ep = channelEndpoint.removeValue(forKey: ObjectIdentifier(channel)),
-           inboundByEndpoint[ep] === channel {
-            inboundByEndpoint[ep] = nil
-        }
+        for (ep, ch) in clientChannels where ch === channel { clientChannels[ep] = nil }
     }
 
-    // MARK: NodeEnvironment
+    // MARK: ProcessEnvironment
 
     public var now: UInt64 {
         UInt64((NIODeadline.now() - startTime).nanoseconds / 1000) + 1
@@ -90,64 +84,68 @@ public final class NodeHost: NodeEnvironment, @unchecked Sendable {
         UInt64(Date().timeIntervalSince1970 * 1_000_000)
     }
 
-    public func send(_ message: Message, to ep: Endpoint) {
+    public func send(_ message: Message, from: Endpoint, to: Endpoint) {
         loop.preconditionInEventLoop()
-        let buf = encodeFrame(.message(message), allocator: ByteBufferAllocator())
-        if ep.hasPrefix("client:") {
-            inboundByEndpoint[ep]?.writeAndFlush(buf, promise: nil)
+        let buf = encodeFrame(Frame(from: from, to: to, message: message), allocator: ByteBufferAllocator())
+        if to.hasPrefix("client:") {
+            clientChannels[to.processAddress]?.writeAndFlush(buf, promise: nil)
             return
         }
-        switch outbound[ep] {
+        let dest = to.processAddress
+        if dest == address {
+            // Local delivery (roles on the same process), asynchronously like the network.
+            loop.execute { [self] in self.process?.receive(message, from: from, to: to) }
+            return
+        }
+        switch outbound[dest] {
         case .ready(let ch)?:
             ch.writeAndFlush(buf, promise: nil)
         case .connecting(var queue)?:
             queue.append(buf)
-            outbound[ep] = .connecting(queue)
+            outbound[dest] = .connecting(queue)
         case nil:
-            if let until = downUntil[ep], until > .now() { return }  // drop, like a lost packet
-            dial(ep, first: buf)
+            if let until = downUntil[dest], until > .now() { return }  // drop, like a lost packet
+            dial(dest, first: buf)
         }
     }
 
-    private func dial(_ ep: Endpoint, first: ByteBuffer) {
-        guard let (host, port) = parseEndpoint(ep) else {
-            log(.warning, "cannot route to \(ep)")
+    private func dial(_ dest: Endpoint, first: ByteBuffer) {
+        guard let (host, port) = parseEndpoint(dest) else {
+            log(.warning, "cannot route to \(dest)")
             return
         }
-        outbound[ep] = .connecting([first])
-        let me = endpoint
+        outbound[dest] = .connecting([first])
         ClientBootstrap(group: loop)
             .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
             .connectTimeout(.milliseconds(500))
             .channelInitializer { [self] channel in
-                // Replies normally come on our own inbound connections; anything a peer
-                // sends back on this one is still delivered.
+                // Replies normally arrive on the peer's own connections to us, but deliver
+                // anything sent back on this one too.
                 installFramePipeline(channel, onFrame: { _, frame in
-                    if case .message(let m) = frame { self.node?.receive(m, from: ep) }
+                    self.process?.receive(frame.message, from: frame.from, to: frame.to)
                 }, onClose: { ch in
-                    if case .ready(let c)? = self.outbound[ep], c === ch { self.outbound[ep] = nil }
+                    if case .ready(let c)? = self.outbound[dest], c === ch { self.outbound[dest] = nil }
                 })
             }
             .connect(host: host, port: port)
             .whenComplete { [self] result in
                 switch result {
                 case .success(let ch):
-                    ch.write(encodeFrame(.hello(me), allocator: ch.allocator), promise: nil)
-                    if case .connecting(let queue)? = self.outbound[ep] {
+                    if case .connecting(let queue)? = self.outbound[dest] {
                         for b in queue { ch.write(b, promise: nil) }
                     }
                     ch.flush()
-                    self.outbound[ep] = .ready(ch)
+                    self.outbound[dest] = .ready(ch)
                 case .failure(let error):
-                    self.outbound[ep] = nil
-                    self.downUntil[ep] = .now() + .milliseconds(200)
-                    self.log(.debug, "dial \(ep) failed: \(error)")
+                    self.outbound[dest] = nil
+                    self.downUntil[dest] = .now() + .milliseconds(200)
+                    self.log(.debug, "dial \(dest) failed: \(error)")
                 }
             }
     }
 
     public func schedule(after micros: UInt64, _ action: @escaping () -> Void) {
-        // Timers always fire on `loop`, the node's only thread.
+        // Timers always fire on `loop`, the process's only thread.
         let box = UncheckedBox(action)
         loop.scheduleTask(in: .microseconds(Int64(micros))) { box.value() }
     }
@@ -167,4 +165,48 @@ public final class NodeHost: NodeEnvironment, @unchecked Sendable {
 struct UncheckedBox<T>: @unchecked Sendable {
     let value: T
     init(_ value: T) { self.value = value }
+}
+
+/// Durable small-file storage: each key is a file, written atomically (temp file, fsync,
+/// rename, fsync directory).
+public final class FileDisk: Disk {
+    let directory: String
+
+    public init(directory: String) throws {
+        self.directory = directory
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    }
+
+    private func path(_ key: String) -> String { "\(directory)/\(key)" }
+
+    public func read(_ key: String) -> Bytes? {
+        FileManager.default.contents(atPath: path(key)).map { Bytes($0) }
+    }
+
+    public func write(_ key: String, _ value: Bytes) {
+        let tmp = path(key) + ".tmp"
+        let fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        precondition(fd >= 0, "cannot write \(tmp): errno \(errno)")
+        value.withUnsafeBytes { buf in
+            var off = 0
+            while off < buf.count {
+                let n = Foundation.write(fd, buf.baseAddress! + off, buf.count - off)
+                precondition(n > 0, "write failed: errno \(errno)")
+                off += n
+            }
+        }
+        precondition(fsync(fd) == 0, "fsync failed: errno \(errno)")
+        close(fd)
+        precondition(rename(tmp, path(key)) == 0, "rename failed: errno \(errno)")
+        let dfd = open(directory, O_RDONLY)
+        if dfd >= 0 { _ = fsync(dfd); close(dfd) }
+    }
+}
+
+/// Non-durable disk for processes that don't need one (or tests).
+public final class MemoryDisk: Disk {
+    private var values: [String: Bytes] = [:]
+    public init() {}
+    public func read(_ key: String) -> Bytes? { values[key] }
+    public func write(_ key: String, _ value: Bytes) { values[key] = value }
 }

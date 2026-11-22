@@ -6,7 +6,7 @@ public enum SwiftCacheError: Error, Sendable, Equatable, CustomStringConvertible
     /// Retried automatically by `Database.transaction`.
     case notCommitted
     /// The transaction's read version fell out of the MVCC window (or predates a
-    /// coordinator recovery). Retried automatically unless the version was pinned.
+    /// transaction-system recovery). Retried automatically unless the version was pinned.
     case transactionTooOld
     /// A storage server hadn't caught up to the read version in time. Retried automatically.
     case futureVersion
@@ -62,6 +62,7 @@ public enum SwiftCacheError: Error, Sendable, Equatable, CustomStringConvertible
         case .invalidRequest: self = .invalidRequest("rejected by server")
         case .tooLarge: self = .tooLarge
         case .internalError: self = .internalError("server error")
+        case .staleGeneration: self = .unavailable("transaction system changed generation")
         }
     }
 }

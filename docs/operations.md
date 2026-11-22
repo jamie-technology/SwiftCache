@@ -1,7 +1,7 @@
 # Operations (k3s)
 
-Production deployments target k3s. Everything here is tested against the local colima k3s
-cluster by `scripts/k3s-test.sh`.
+Production deployments target k3s. Everything here is exercised against the local colima
+k3s cluster by `scripts/k3s-test.sh`.
 
 ## Deploy
 
@@ -14,97 +14,98 @@ What gets created (namespace `swiftcache`):
 
 | Object | Purpose |
 | --- | --- |
-| `ConfigMap swiftcache-config` | `REPLICATION`, `MVCC_WINDOW_SECONDS`, `COORDINATOR` endpoint |
-| `StatefulSet swiftcache-coordinator` (1 pod) + `Service` | The coordinator, at `swiftcache-coordinator.swiftcache.svc.cluster.local:7400` |
-| `StatefulSet swiftcache-storage` (4 pods) + headless `Service` | Storage servers, each advertising `<pod>.swiftcache-storage.swiftcache.svc.cluster.local:7500` |
+| `ConfigMap swiftcache-config` | `CLUSTER` (the coordinator list; every process and client uses it), `REPLICATION`, `LOGS`, `PROXIES`, `MVCC_WINDOW_SECONDS` |
+| headless `Service swiftcache` | A stable DNS name per pod: `<pod>.swiftcache.swiftcache.svc.cluster.local:4500` |
+| `StatefulSet swiftcache-coordinator` (3) + PVCs | Coordinators (durable state on a 64 Mi volume) that also host stateless roles: controller, master, commit proxies, resolver |
+| `StatefulSet swiftcache-log` (3) | Transaction logs |
+| `StatefulSet swiftcache-storage` (4) | Storage servers: 2 shards × 2 replicas |
 
-With `REPLICATION=2` and 4 storage pods you get 2 shards × 2 replicas. On multi-node clusters
-the topology spread constraint keeps replicas on different nodes.
+Use `kubectl -n swiftcache logs` on a coordinator pod to follow elections and recoveries,
+and `swiftcache-cli status` (below) to see which pod currently hosts each role.
 
-For a production image registry, push the image and replace `image:` (and set
-`imagePullPolicy: Always` or pin digests).
+**Coordinator membership is static:** the `CLUSTER` list is fixed at deploy time (as in
+FoundationDB's cluster file). Keep coordinator pods on separate nodes in multi-node
+clusters. The spread constraints try to.
 
 ## Scaling capacity
 
-Each storage pod holds its shard's slice of the data in memory (the default limit is 1Gi per
-pod). Total capacity ≈ `shards × per-pod memory`. To add a shard, add `REPLICATION` pods:
+Each storage pod holds its shard's slice of data in memory (1 Gi limit per pod by default).
+Total capacity ≈ `shards × per-pod memory`. To add a shard, add `REPLICATION` storage pods:
 
 ```bash
 kubectl -n swiftcache scale statefulset swiftcache-storage --replicas=6
 ```
 
-The new pods join the pool, form a shard, and the coordinator migrates slots in 2,048-slot steps
-until slot counts are balanced. Reads and writes keep working during migration. Watch it with:
+The new pods register, the controller forms a shard from them, and slots migrate in
+2,048-slot steps until balanced. Reads and writes continue throughout. A leftover pod (not a
+multiple of `REPLICATION`) waits idle and replaces the next failed replica. Scaling *down*
+isn't supported yet.
 
-```bash
-swiftcache-cli status --stats
-```
-
-Scale storage pods in multiples of `REPLICATION`. A leftover pod waits in the unassigned pool
-and replaces the next failed replica. Scaling **down** is not yet supported (see roadmap).
+More commit proxies (`PROXIES`) and logs (`LOGS`) take effect at the next recovery.
+Restarting one coordinator pod triggers one, or the cluster restores missing redundancy by
+itself.
 
 ## The CLI
 
 The image contains `swiftcache-cli`. Run it as a one-off pod:
 
 ```bash
-alias sc='kubectl -n swiftcache run cli-$RANDOM --rm -i --quiet --restart=Never --image=swiftcache:latest \
-  --env=SWIFTCACHE_COORDINATOR=swiftcache-coordinator.swiftcache.svc.cluster.local:7400 \
-  --command -- swiftcache-cli'
+CLUSTER=$(kubectl -n swiftcache get configmap swiftcache-config -o jsonpath='{.data.CLUSTER}')
+alias sc="kubectl -n swiftcache run cli-\$RANDOM --rm -i --quiet --restart=Never --image=swiftcache:latest \
+  --env=SWIFTCACHE_CLUSTER=$CLUSTER --command -- swiftcache-cli"
 
-sc status --stats                     # shards, slot counts, replicas, per-server keys/memory
+sc status --stats                    # generation, role placement, shards, storage, processes
 sc set greeting hello --ttl 60
-sc get greeting                       # value + versionstamp
+sc get greeting                      # value + versionstamp
 sc get greeting --at-version 1795341970010421
 sc cas greeting 000660da9fde0c9f0000 "hi"   # expected versionstamp, or 'none'
 sc incr page-views --by 1
 sc range user/ --limit 20
 sc read-version
-sc wait-ready --shards 3              # block until N fully replicated, balanced shards
-sc verify --min-shards 2              # end-to-end correctness suite
+sc wait-ready --shards 3 --min-generation 5
+sc verify --min-shards 2             # end-to-end correctness suite
 sc bench --seconds 10 --concurrency 32 --read-ratio 0.8
 ```
 
 ## Failure behaviour
 
-- **Storage pod dies or is deleted.** Its shard keeps serving from the other replicas. After
-  `--failure-timeout` (3s) the replica leaves the commit quorum. The restarted pod rejoins
-  empty, copies a snapshot from a peer and becomes active again (`catching_up` → `active` in
-  `status`).
-- **Coordinator pod dies.** Writes pause; reads at known versions continue. The new pod
-  recovers from storage reports in about `--recovery-window` (3s) and clients retry
-  transparently.
-- **All replicas of a shard die.** That shard's data is lost (in-memory). Commits touching it
-  stall for up to `--shard-loss-timeout` (120s), in case the replicas are only unreachable, and
-  then its slots are reassigned empty.
-- **Node failure** on multi-node k3s. Spread constraints keep replicas apart, so a node loss
-  costs one replica per shard.
-
-## Tuning flags (`swiftcache-server … --help`)
-
-| Flag | Default (k8s) | Notes |
+| Failure | What happens | Client-visible |
 | --- | --- | --- |
-| `--replication` | 2 | Coordinator only. Replicas per shard. |
-| `--mvcc-window` | 10s | How far back historical reads and long transactions work. Costs memory for overwritten keys. |
-| `--failure-timeout` | 3s | Unacknowledged-batch time before a replica is dropped. |
-| `--shard-loss-timeout` | 120s | Silence tolerated from a shard's *last* replica before its data is given up. |
-| `--recovery-window` | 3s | Coordinator start-up wait for storage reports. |
-| `--coordinator-timeout` | 2s | Storage-side: silence before re-joining the coordinator. |
+| Storage pod dies | Its shard keeps serving from the other replicas. After `--failure-timeout` the replica is removed; the restarted pod is re-added and copies the shard from a peer | Nothing (reads use other replicas) |
+| Log pod dies | The controller recovers a new generation on the remaining logs, then restores 3 logs when the pod is back | Commits pause for the recovery (~1–3 s); retried automatically |
+| Pod hosting the controller / master / proxies dies | Re-election (if the controller died) and recovery | Commits pause; retried automatically |
+| One coordinator dies | Nothing, as long as a majority remains | Nothing |
+| A coordinator majority is down | The running generation keeps committing. No re-election or recovery is possible until a majority returns | Nothing, unless a transaction role also fails |
+| All coordinators restart together | Their state is on PVCs; the next recovery reads it and continues | Commits pause for the recovery |
+| Every replica of a shard dies at once | That shard's data is lost (in-memory). After `--shard-loss-timeout` its slots are reassigned empty | Data loss for those keys |
+| Every log of a generation dies at once | Commits not yet applied by storage are lost; the cluster continues from what storage has | Loss of the most recent commits |
+
+## Server flags (`swiftcache-server --help`)
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--class` | — | `stateless`, `log` or `storage` |
+| `--coordinators` | — | The cluster file: comma-separated `host:port` |
+| `--coordinator`, `--data-dir` | — | This process is a coordinator; its durable state lives in `--data-dir` |
+| `--replication` | 2 | Storage replicas per shard |
+| `--logs` | 3 | Transaction logs per generation |
+| `--proxies` | 2 | Commit proxies per generation |
+| `--mvcc-window` | 10 s | How far back historical reads and long transactions work |
+| `--failure-timeout` | 3 s | Missed registrations before a process counts as dead |
+| `--shard-loss-timeout` | 120 s | Silence tolerated from a shard's *last* replica before its data is given up |
 | `--log-level` | info | |
 
-## Observability
-
-Logs go to stderr (`kubectl logs`). The coordinator logs membership changes, data movements,
-failures and recoveries. `swiftcache-cli status --stats` shows versions, commit and conflict
-counters, the topology and per-server stats. A metrics endpoint is on the roadmap.
+Production timings are more conservative than the simulator's: leases 3 s, heartbeats every
+300 ms, step-down after 1.8 s.
 
 ## Running the end-to-end test
 
 ```bash
-./scripts/k3s-test.sh            # builds the image, deploys a fresh namespace, then:
-                                 # verify → delete storage pod → delete coordinator → verify
-                                 # → scale 2→3 shards → verify → bench
-IMAGE=swiftcache:abc123 ./scripts/k3s-test.sh     # reuse an existing image
+./scripts/k3s-test.sh            # build, deploy a fresh namespace, then:
+                                 #   verify → delete a storage pod → delete a log pod
+                                 #   → delete the controller's pod → delete ALL coordinators
+                                 #   → verify → scale 2→3 shards → verify → bench
+IMAGE=swiftcache:abc123 ./scripts/k3s-test.sh
 ```
 
 **The test deletes and recreates the `swiftcache` namespace.**
