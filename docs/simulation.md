@@ -120,6 +120,7 @@ under these assumptions; it can't prove the real runtime meets them.
 | **add** | Idempotent atomic adds. The total equals the acknowledged adds exactly (plus at most one per add that gave up with an unknown outcome). |
 | **orders** | Idempotent transactions that generate a **new id per attempt**. Every acknowledged id exists, no id is returned twice, and the count equals the number of orders. |
 | **history** | Writes, then re-reads earlier writes at their commit version (`read(atVersion:)`). Exact match; reads before a write don't see it. |
+| **realtime** | One client increments a counter (read-modify-write); an independent client checks that transactions it starts afterwards reflect every acknowledged increment: read-only results, values a body acts on (an error thrown on seeing a stale value must never escape), and committed read-modify-writes. |
 | **global** | No versionstamp is ever handed to two commits. |
 
 **At the end**, after healing and quiescing: every invariant is re-checked by a fresh client;

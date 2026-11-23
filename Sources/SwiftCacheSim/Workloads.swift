@@ -93,6 +93,7 @@ public func runSimulation(seed: UInt64, options: SimulationOptions = SimulationO
                 for i in 0..<accounts { try tr.set("bank/\(pad(i))", 100) }
                 for i in 0..<cycleSize { try tr.set("cycle/\(pad(i))", (i + 1) % cycleSize) }
                 try tr.set("cas/counter", 0)
+                try tr.set("rt/c", 0)
                 tr.add("add/total", 0)
                 tr.add("orders/count", 0)
             }
@@ -112,7 +113,15 @@ public func runSimulation(seed: UInt64, options: SimulationOptions = SimulationO
         opts.requestTimeout = 1_000_000
         opts.maxRetries = 400
         let db = Database(coordinators: sim.coordinatorAddresses, transport: sim.makeClientTransport(), options: opts)
-        let kind = c % 6
+        let kind = c % 7
+        if kind == 6 {
+            // Real-time order needs a second, independent client: the writer's acks must
+            // be visible to transactions the reader starts afterwards.
+            let reader = Database(coordinators: sim.coordinatorAddresses, transport: sim.makeClientTransport(), options: opts)
+            sim.spawn { await realtimeWriter(sim, db, counters, until: workEnd) }
+            sim.spawn { await realtimeReader(sim, reader, counters, until: workEnd) }
+            continue
+        }
         sim.spawn {
             switch kind {
             case 0: await bankWorkload(sim, db, counters, accounts: accounts, until: workEnd)
@@ -161,7 +170,9 @@ public func runSimulation(seed: UInt64, options: SimulationOptions = SimulationO
     checkLogRetention(sim)
     checkCoordinatorsAgree(sim)
     if options.clients >= 6 {
-        for k in ["bank.commits", "cycle.commits", "cas.success", "add.commits", "orders.commits", "history.commits"] where counters[k] == 0 {
+        let realtime = options.clients >= 7 ? ["realtime.writes", "realtime.checks"] : []
+        for k in ["bank.commits", "cycle.commits", "cas.success", "add.commits", "orders.commits", "history.commits"] + realtime
+        where counters[k] == 0 {
             sim.fail("no progress: \(k) == 0")
         }
     }
@@ -458,6 +469,62 @@ func ordersWorkload(_ sim: Simulator, _ db: Database, _ counters: Counters, unti
             counters.inc("orders.commits")
         } catch {
             handle(sim, counters, "orders", error)
+        }
+    }
+}
+
+/// Increments `rt/c` (read-modify-write) and publishes each acknowledged value.
+func realtimeWriter(_ sim: Simulator, _ db: Database, _ counters: Counters, until end: UInt64) async {
+    while sim.now < end {
+        do {
+            let v = try await db.transaction { tr -> Int in
+                let c = try await tr.get("rt/c", as: Int.self) ?? 0
+                try tr.set("rt/c", c + 1)
+                return c + 1
+            }
+            counters.values["rt.acked"] = max(counters["rt.acked"], v)
+            counters.inc("realtime.writes")
+        } catch {
+            // Retries exhausted under faults; carry on.
+        }
+    }
+}
+
+struct StaleObservation: Error { let saw: Int, acked: Int }
+
+/// Transactions started after an acknowledged write must reflect it (strict
+/// serializability), however their read version was chosen: a read-only transaction
+/// sees it; a body that throws on seeing a stale value never surfaces that error; a
+/// committed read-modify-write never acted on a stale value.
+func realtimeReader(_ sim: Simulator, _ db: Database, _ counters: Counters, until end: UInt64) async {
+    var round = 0
+    while sim.now < end {
+        round += 1
+        let acked = counters["rt.acked"]
+        do {
+            switch round % 3 {
+            case 0:
+                let v = try await db.transaction { tr in try await tr.get("rt/c", as: Int.self) ?? 0 }
+                if v < acked { sim.fail("realtime: read-only transaction saw rt/c=\(v) after \(acked) was acknowledged") }
+            case 1:
+                try await db.transaction { tr in
+                    let v = try await tr.get("rt/c", as: Int.self) ?? 0
+                    if v < acked { throw StaleObservation(saw: v, acked: acked) }
+                    try tr.set("rt/seen", v)
+                }
+            default:
+                let v = try await db.transaction { tr -> Int in
+                    let v = try await tr.get("rt/c", as: Int.self) ?? 0
+                    try tr.set("rt/copy", v)
+                    return v
+                }
+                if v < acked { sim.fail("realtime: committed read-modify-write read rt/c=\(v) after \(acked) was acknowledged") }
+            }
+            counters.inc("realtime.checks")
+        } catch let e as StaleObservation {
+            sim.fail("realtime: a transaction body observed rt/c=\(e.saw) after \(e.acked) was acknowledged, and that escaped")
+        } catch {
+            // Retries exhausted under faults: nothing was observed.
         }
     }
 }

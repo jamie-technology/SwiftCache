@@ -132,10 +132,19 @@ In k3s, these took 32-client get/set/txn from 85k/24k/10.6k to 115k/40k/17.4k op
   about half of all messages per commit batch), larger commit batches at medium load, and
   per-message cost (frames carry two endpoint strings that are decoded and hashed on
   every message).
-- **Transactions** could overlap their read-version request with their first read. That
-  is safe for transactions that commit writes (optimistic concurrency validates them at a
-  commit version above every earlier acknowledgement), but a read-only transaction, or one
-  whose body throws based on what it read, would need its snapshot re-validated against a
-  fresh read version.
+- **Tried and rejected (measured locally, Performance III):**
+  - *Overlapping a transaction's read version with its first read* (adopting a replica's
+    latest version). Without waiting for the read version: +30% transactions/s with one
+    client, but −60% at 256 clients (an older read version widens the conflict window), and
+    a transaction body could observe a snapshot older than commits acknowledged before it
+    started (caught by the simulator's cycle invariant). Waiting for the read version
+    first (strict): slower at every concurrency, since the replica was behind it about
+    half the time.
+  - *More read-version requests in flight per client lane* (1 → 2 or 4): no measurable
+    change.
+- **32-client writes in k3s are latency-bound, not CPU-bound**: during a 32-client set run
+  the node used 2.2 of 4 cores and no pod was saturated (master+proxy 0.47 core, each log
+  0.26). The levers there are per-hop latency and how many commit batches a client keeps
+  in flight, not CPU per message.
 - **Single-client latency** (get 0.07 ms vs Redis 0.015 ms) is dominated by fixed per-hop
   costs in the server event loops and the client.
