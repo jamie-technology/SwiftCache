@@ -105,18 +105,37 @@ public struct SlotSet: Hashable, Sendable, CustomStringConvertible {
     public var ranges: [(start: Int, end: Int)] {
         var out = [(Int, Int)]()
         var start = -1
-        for s in 0...Slots.count {
-            let has = s < Slots.count && contains(s)
+        var s = 0
+        while s < Slots.count {
+            let w = words[s >> 6]
+            // Skip whole words that can't change the current run.
+            if s & 63 == 0 && ((w == 0 && start < 0) || (w == .max && start >= 0)) {
+                s += 64
+                continue
+            }
+            let has = w & (1 << UInt64(s & 63)) != 0
             if has && start < 0 { start = s }
             if !has && start >= 0 { out.append((start, s)); start = -1 }
+            s += 1
         }
+        if start >= 0 { out.append((start, Slots.count)) }
         return out
     }
 
     public init(ranges: [(start: Int, end: Int)]) {
         self.init()
         for r in ranges where r.start < r.end {
-            for s in max(0, r.start)..<min(Slots.count, r.end) { insert(s) }
+            var s = max(0, r.start)
+            let end = min(Slots.count, r.end)
+            while s < end {
+                if s & 63 == 0 && end - s >= 64 {
+                    words[s >> 6] = .max  // whole word
+                    s += 64
+                } else {
+                    insert(s)
+                    s += 1
+                }
+            }
         }
     }
 

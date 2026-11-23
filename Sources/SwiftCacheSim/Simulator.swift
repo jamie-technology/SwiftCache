@@ -85,6 +85,8 @@ public final class Simulator: @unchecked Sendable {
     public let seed: UInt64
     public var network = NetworkProfile()
     public var config: ClusterConfig
+    /// Maximum relative clock-rate skew per process (e.g. 0.08 = ±8%).
+    public var clockSkew = 0.0
 
     // Event queue.
     private struct Event: Comparable {
@@ -108,6 +110,14 @@ public final class Simulator: @unchecked Sendable {
         var alive = true
         /// Survives restarts (only coordinators use it).
         let disk = SimDisk()
+        /// This machine's clock runs at `clockRate` × real time (clock-rate skew).
+        var clockRate = 1.0
+        /// While `pausedUntil > now` the process is frozen (GC/scheduler stall): nothing is
+        /// delivered and no timer fires; everything is released, in order, afterwards.
+        var pausedUntil: UInt64 = 0
+        /// While `holdOutgoingUntil > now`, everything the process sends is queued (it keeps
+        /// running and deciding); the queue is released, in order, afterwards.
+        var holdOutgoingUntil: UInt64 = 0
         init(address: Endpoint, processClass: ProcessClass, isCoordinator: Bool) {
             self.address = address
             self.processClass = processClass
@@ -173,6 +183,9 @@ public final class Simulator: @unchecked Sendable {
         }
         if coordinator { coordinatorAddresses.append(address) }
         let p = Process(address: address, processClass: cls, isCoordinator: coordinator)
+        if clockSkew > 0 {
+            p.clockRate = 1 + clockSkew * (Double(random.below(2_001)) / 1_000 - 1)
+        }
         processes[address] = p
         if shouldBoot { boot(p) }
         return address
@@ -183,7 +196,8 @@ public final class Simulator: @unchecked Sendable {
     private func boot(_ p: Process) {
         p.incarnation += 1
         p.alive = true
-        let env = SimProcessEnvironment(sim: self, address: p.address, incarnation: p.incarnation, disk: p.disk)
+        let env = SimProcessEnvironment(sim: self, address: p.address, incarnation: p.incarnation, disk: p.disk,
+                                        clockRate: p.clockRate, clockBase: now)
         let host = ServerProcess.make(env: env, processClass: p.processClass, isCoordinator: p.isCoordinator,
                                       coordinators: coordinatorEndpoints, config: config)
         p.host = host
@@ -237,6 +251,28 @@ public final class Simulator: @unchecked Sendable {
         trace("KILL ROLE \(endpoint)")
     }
 
+    /// Freezes a process for `duration` µs, like a long GC or scheduler pause: its
+    /// connections stay up, but it handles nothing until the pause ends.
+    public func pause(_ address: Endpoint, for duration: UInt64) {
+        guard let p = processes[address], p.alive else { return }
+        p.pausedUntil = max(p.pausedUntil, now + duration)
+        trace("PAUSE \(address) for \(duration / 1000)ms")
+    }
+
+    func pausedUntil(_ address: Endpoint) -> UInt64? {
+        guard let p = processes[address], p.pausedUntil > now else { return nil }
+        return p.pausedUntil
+    }
+
+    /// Delays everything a process sends for `duration` µs without breaking connections:
+    /// models a process whose decisions reach the world late (stall after deciding, slow
+    /// outbound path).
+    public func holdOutgoing(_ address: Endpoint, for duration: UInt64) {
+        guard let p = processes[address], p.alive else { return }
+        p.holdOutgoingUntil = max(p.holdOutgoingUntil, now + duration)
+        trace("HOLD OUTGOING \(address) for \(duration / 1000)ms")
+    }
+
     /// Isolates a process from the network for `duration` µs (connections break).
     public func partition(_ address: Endpoint, for duration: UInt64) {
         partitionedUntil[address] = max(partitionedUntil[address] ?? 0, now + duration)
@@ -267,6 +303,14 @@ public final class Simulator: @unchecked Sendable {
 
     func send(_ message: Message, from: Endpoint, to: Endpoint) {
         let src = from.processAddress, dst = to.processAddress
+        if let p = processes[src], p.holdOutgoingUntil > now {
+            let incarnation = p.incarnation
+            scheduleAt(p.holdOutgoingUntil) { [weak self] in
+                guard let self, p.alive, p.incarnation == incarnation else { return }
+                self.send(message, from: from, to: to)
+            }
+            return
+        }
         if isPartitioned(src) || isPartitioned(dst) { return }
         if let p = processes[src], !p.alive { return }
         let link = Link(from: src, to: dst)
@@ -307,6 +351,15 @@ public final class Simulator: @unchecked Sendable {
             return
         }
         guard let p = processes[to.processAddress], p.alive, let host = p.host else { return }
+        if p.pausedUntil > now {
+            // Frozen: hold it (events at the same time keep their order).
+            let incarnation = p.incarnation
+            scheduleAt(p.pausedUntil) { [weak self] in
+                guard let self, p.incarnation == incarnation else { return }
+                self.deliver(message, from: from, to: to)
+            }
+            return
+        }
         host.receive(message, from: from, to: to)
     }
 
@@ -434,12 +487,17 @@ final class SimProcessEnvironment: ProcessEnvironment {
     let address: Endpoint
     let incarnation: UInt64
     let disk: any Disk
+    /// Local clock = clockBase + (sim time − clockBase) × clockRate.
+    let clockRate: Double
+    let clockBase: UInt64
 
-    init(sim: Simulator, address: Endpoint, incarnation: UInt64, disk: any Disk) {
+    init(sim: Simulator, address: Endpoint, incarnation: UInt64, disk: any Disk, clockRate: Double, clockBase: UInt64) {
         self.sim = sim
         self.address = address
         self.incarnation = incarnation
         self.disk = disk
+        self.clockRate = clockRate
+        self.clockBase = clockBase
     }
 
     private var isCurrent: Bool {
@@ -447,8 +505,8 @@ final class SimProcessEnvironment: ProcessEnvironment {
         return p.alive && p.incarnation == incarnation
     }
 
-    var now: UInt64 { sim.now }
-    var versionClock: UInt64 { sim.now }
+    var now: UInt64 { clockBase + UInt64(Double(sim.now - clockBase) * clockRate) }
+    var versionClock: UInt64 { now }
 
     func send(_ message: Message, from: Endpoint, to: Endpoint) {
         guard isCurrent else { return }
@@ -456,10 +514,18 @@ final class SimProcessEnvironment: ProcessEnvironment {
     }
 
     func schedule(after micros: UInt64, _ action: @escaping () -> Void) {
-        sim.schedule(after: micros) { [weak self] in
-            guard let self, self.isCurrent else { return }
-            action()
+        // `micros` of *local* time is micros / clockRate of real time.
+        let real = UInt64((Double(micros) / clockRate).rounded(.up))
+        sim.schedule(after: real) { [weak self] in self?.fire(action) }
+    }
+
+    private func fire(_ action: @escaping () -> Void) {
+        guard isCurrent else { return }
+        if let until = sim.pausedUntil(address) {
+            sim.at(until) { [weak self] in self?.fire(action) }
+            return
         }
+        action()
     }
 
     func random(_ upperBound: UInt64) -> UInt64 { sim.random.below(upperBound) }

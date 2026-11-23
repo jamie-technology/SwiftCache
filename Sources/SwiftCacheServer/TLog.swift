@@ -17,6 +17,8 @@ public final class TLogRole: Role {
 
     private var ready = false
     public private(set) var locked = false
+    /// The read-version lease granted to this generation's master runs until here.
+    private var leaseExpiry: UInt64 = 0
     public var generation: UInt64 { spec.generation }
     private var entries = Deque<LogEntry>()
     /// Last version appended.
@@ -113,13 +115,26 @@ public final class TLogRole: Role {
                 while let v = tagVersions[tag]?.first, v <= version { tagVersions[tag]!.removeFirst() }
                 collectGarbage()
             }
+        case .tlogLease(let rid, let generation):
+            // A locked log grants nothing: the old master can't renew past a recovery.
+            guard ready, !locked, generation == spec.generation else { return }
+            leaseExpiry = context.now + config.readVersionLease
+            context.send(.ack(rid: rid), to: from)
         case .tlogLock(let rid, let generation):
             if generation == spec.generation {
                 if !locked { context.log(.info, "locked by recovery (durable \(durable), committed \(knownCommitted))") }
                 locked = true
                 wakePeekWaiters()
-                context.send(.tlogLockReply(rid: rid, LockReply(known: true, generation: spec.generation,
-                                                                 durableVersion: durable, knownCommitted: knownCommitted)), to: from)
+                // Stop accepting pushes now, but don't let the recovery proceed until the
+                // read-version lease we granted has expired.
+                let reply = Message.tlogLockReply(rid: rid, LockReply(known: true, generation: spec.generation,
+                                                                     durableVersion: durable, knownCommitted: knownCommitted))
+                let wait = leaseExpiry > context.now ? leaseExpiry - context.now : 0
+                if wait == 0 {
+                    context.send(reply, to: from)
+                } else {
+                    context.schedule(after: wait) { [weak self] in self?.context.send(reply, to: from) }
+                }
             } else {
                 context.send(.tlogLockReply(rid: rid, LockReply(known: false, generation: spec.generation, durableVersion: 0, knownCommitted: 0)), to: from)
             }
@@ -157,6 +172,11 @@ public final class TLogRole: Role {
             appended = true
         }
         if appended {
+            // Commit acknowledgement path: the master learns durability directly from
+            // every log (no extra proxy -> master round trip).
+            if !spec.master.isEmpty {
+                context.send(.tlogDurable(generation: spec.generation, version: durable), to: spec.master)
+            }
             collectGarbage()
             wakePeekWaiters()
         }
@@ -247,7 +267,8 @@ public final class TLogRole: Role {
         let limit = upTo > 0 ? min(upTo, durable) : knownCommitted
         // Hold the request unless there's new data for the tag, the waiting read's version
         // has become available, or the caller asked for a fixed range.
-        let answerable = upTo > 0 || locked || need == .max || (need > after && limit >= need) || hasData(tag, after: after, through: limit)
+        let answerable = upTo > 0 || locked || need == .max || (need > after && limit >= need)
+            || limit >= after &+ config.replicaFreshness || hasData(tag, after: after, through: limit)
         if limit <= after || !answerable {
             if locked || upTo > 0 || need == .max {
                 context.send(.tlogPeekReply(rid: rid, PeekReply(status: locked ? .stopped : .ok, entries: [], end: after)), to: from)
@@ -302,8 +323,13 @@ public final class TLogRole: Role {
         let waiting = peekWaiters
         peekWaiters = []
         for w in waiting {
+            // Answer when the tag has new data, a waiting read needs the version, or the
+            // replica would otherwise fall more than `replicaFreshness` behind committed
+            // (keeps idle replicas current for "latest" reads).
             let ready = locked || (knownCommitted > w.after
-                && ((w.need > w.after && knownCommitted >= w.need) || hasData(w.tag, after: w.after, through: knownCommitted)))
+                && ((w.need > w.after && knownCommitted >= w.need)
+                    || knownCommitted >= w.after &+ config.replicaFreshness
+                    || hasData(w.tag, after: w.after, through: knownCommitted)))
             if ready {
                 handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, need: w.need, from: w.from, waiterID: w.id)
             } else {

@@ -56,6 +56,9 @@ public enum Message: Hashable, Sendable {
     // MARK: Master <-> proxies
     case getCommitVersion(rid: UInt64, proxyIndex: UInt32, requestNum: UInt64)
     case commitVersionReply(rid: UInt64, prevVersion: Version, version: Version)
+    /// Proxy -> master: allocate this batch's version and forward it to the resolver, which
+    /// replies to the proxy directly (one round trip for version + resolution).
+    case versionAndResolve(rid: UInt64, requestNum: UInt64, ResolveRequest)
     case reportCommitted(rid: UInt64, version: Version)
     case getLiveCommitted(rid: UInt64)
     case liveCommittedReply(rid: UInt64, version: Version)
@@ -81,6 +84,13 @@ public enum Message: Hashable, Sendable {
     /// Proxy -> logs: everything up to `version` is on every log (lets storage read it now
     /// instead of waiting for the next push to carry the news).
     case tlogCommitted(generation: UInt64, version: Version)
+    /// Log -> master: everything up to `version` is durable on this log.
+    case tlogDurable(generation: UInt64, version: Version)
+    /// Master -> log: grant a read-version lease (the log won't complete a recovery lock
+    /// until it expires). Replied to with `ack`.
+    case tlogLease(rid: UInt64, generation: UInt64)
+    /// Master -> proxies: everything up to `version` is on every log (committed).
+    case committedVersion(generation: UInt64, version: Version)
     case tlogFetchReply(rid: UInt64, FetchReply)
 
     /// The request id if this is a request or reply.
@@ -96,13 +106,13 @@ public enum Message: Hashable, Sendable {
              .genWrite(let r, _, _), .genWriteReply(let r, _, _),
              .registerWorker(let r, _), .registerReply(let r, _, _), .recruit(let r, _), .recruitReply(let r, _),
              .recoveryComplete(let r, _), .ack(let r), .getShardMap(let r, _), .shardMapReply(let r, _),
-             .getCommitVersion(let r, _, _), .commitVersionReply(let r, _, _), .getLiveCommitted(let r), .reportCommitted(let r, _),
+             .getCommitVersion(let r, _, _), .commitVersionReply(let r, _, _), .versionAndResolve(let r, _, _), .getLiveCommitted(let r), .reportCommitted(let r, _),
              .liveCommittedReply(let r, _), .resolve(let r, _), .resolveReply(let r, _),
              .tlogPush(let r, _), .tlogPushReply(let r, _), .tlogPeek(let r, _, _, _, _), .tlogPeekReply(let r, _),
              .tlogLock(let r, _), .tlogLockReply(let r, _), .tlogConfirm(let r, _), .tlogConfirmReply(let r, _),
-             .tlogFetch(let r, _), .tlogFetchReply(let r, _):
+             .tlogFetch(let r, _), .tlogFetchReply(let r, _), .tlogLease(let r, _):
             return r
-        case .moveReady, .serverDBInfo, .halt, .tlogPop, .tlogCommitted:
+        case .moveReady, .serverDBInfo, .halt, .tlogPop, .tlogCommitted, .tlogDurable, .committedVersion:
             return nil
         }
     }
@@ -187,6 +197,7 @@ extension Message {
 
         case .getCommitVersion(let rid, let p, let n): w.u8(40); w.u64(rid); w.u32(p); w.u64(n)
         case .commitVersionReply(let rid, let prev, let v): w.u8(41); w.u64(rid); w.u64(prev); w.u64(v)
+        case .versionAndResolve(let rid, let n, let req): w.u8(47); w.u64(rid); w.u64(n); w.put(req)
         case .reportCommitted(let rid, let v): w.u8(42); w.u64(rid); w.u64(v)
         case .getLiveCommitted(let rid): w.u8(43); w.u64(rid)
         case .liveCommittedReply(let rid, let v): w.u8(44); w.u64(rid); w.u64(v)
@@ -205,14 +216,18 @@ extension Message {
         case .tlogFetch(let rid, let v): w.u8(59); w.u64(rid); w.u64(v)
         case .tlogFetchReply(let rid, let f): w.u8(60); w.u64(rid); w.put(f)
         case .tlogCommitted(let g, let v): w.u8(61); w.u64(g); w.u64(v)
+        case .tlogDurable(let g, let v): w.u8(65); w.u64(g); w.u64(v)
+        case .tlogLease(let rid, let g): w.u8(67); w.u64(rid); w.u64(g)
+        case .committedVersion(let g, let v): w.u8(66); w.u64(g); w.u64(v)
         }
     }
 
     public static func decode(_ bytes: Bytes) throws -> Message {
-        var r = WireReader(bytes)
-        let m = try decode(from: &r)
-        guard r.isAtEnd else { throw WireError("trailing bytes in \(m.name)") }
-        return m
+        try WireReader.read(bytes) { r in
+            let m = try decode(from: &r)
+            guard r.isAtEnd else { throw WireError("trailing bytes in \(m.name)") }
+            return m
+        }
     }
 
     public static func decode(from r: inout WireReader) throws -> Message {
@@ -266,6 +281,7 @@ extension Message {
 
         case 40: return .getCommitVersion(rid: try r.u64(), proxyIndex: try r.u32(), requestNum: try r.u64())
         case 41: return .commitVersionReply(rid: try r.u64(), prevVersion: try r.u64(), version: try r.u64())
+        case 47: return .versionAndResolve(rid: try r.u64(), requestNum: try r.u64(), try r.get())
         case 42: return .reportCommitted(rid: try r.u64(), version: try r.u64())
         case 43: return .getLiveCommitted(rid: try r.u64())
         case 44: return .liveCommittedReply(rid: try r.u64(), version: try r.u64())
@@ -284,6 +300,9 @@ extension Message {
         case 59: return .tlogFetch(rid: try r.u64(), upTo: try r.u64())
         case 60: return .tlogFetchReply(rid: try r.u64(), try r.get())
         case 61: return .tlogCommitted(generation: try r.u64(), version: try r.u64())
+        case 65: return .tlogDurable(generation: try r.u64(), version: try r.u64())
+        case 67: return .tlogLease(rid: try r.u64(), generation: try r.u64())
+        case 66: return .committedVersion(generation: try r.u64(), version: try r.u64())
         default:
             throw WireError("unknown message tag \(tag)")
         }

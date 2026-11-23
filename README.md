@@ -83,13 +83,13 @@ no pipelining. Redis is a single unreplicated process. SwiftCache is 3 shards ×
 
 | 256 clients | Redis 7 | SwiftCache |
 | --- | --- | --- |
-| GET / `get` | 165k ops/s | **178k ops/s** |
-| SET / `set` (replicated, idempotent) | 151k ops/s | 55k ops/s |
-| 2-key read-modify-write transaction | — | 33k ops/s |
+| GET / `get` | 141k ops/s | **197k ops/s** |
+| SET / `set` (replicated, idempotent) | 144k ops/s | 67k ops/s |
+| 2-key read-modify-write transaction | — | 26k ops/s |
 
-On the same laptop without Docker networking, at 512 clients: **387k gets/s** (p99 2.5 ms),
-117k sets/s, 73–86k two-key transactions/s. With few clients Redis's single round trip wins
-(at 32 clients: 147k vs 44k gets/s). See [docs/performance.md](docs/performance.md) for
+On the same laptop without Docker networking: **427k gets/s** at 512 clients (p99 2.3 ms),
+159k sets/s, ~97k two-key transactions/s; single-client get p50 0.05 ms. With few clients
+Redis's single round trip still wins in k3s (at 32 clients: 175k vs 85k gets/s). See [docs/performance.md](docs/performance.md) for
 methodology, the optimizations made, and what's next.
 
 ## Quick start (k3s)
@@ -112,6 +112,9 @@ kubectl -n swiftcache scale statefulset swiftcache-storage --replicas=6   # add 
 ```bash
 swift build
 swift test                                                       # unit tests, simulation seeds, scenarios, determinism
+                                                                 # (needs Xcode's toolchain for swift-testing macros:
+                                                                 #  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test)
+./scripts/sweep.sh                                               # full validation: 330 chaos seeds + every scenario
 swift run -c release swiftcache-sim --count 500                  # random chaos, 500 seeds
 swift run -c release swiftcache-sim --scenario all --count 25    # targeted fault scenarios
 swift run -c release swiftcache-sim --seed 57 --verbose          # replay one seed with full logs

@@ -27,6 +27,18 @@ public enum Scenario: String, CaseIterable, Sendable {
     /// A coordinator majority disappears: the running generation keeps committing, but no
     /// new generation can form; when they return, the cluster recovers.
     case coordinatorQuorumLoss
+    /// The master freezes (GC/scheduler stall) well past its read-version lease, repeatedly,
+    /// while clients keep committing and reading: it must never hand out a stale read
+    /// version when it wakes, and a new generation must form only once its lease is void.
+    case masterPause
+    /// The running master keeps working but everything it sends (lease renewals, read
+    /// versions, forwarded resolutions) is held until a new generation has formed, then
+    /// released at once: none of it may extend old authority, change new-generation state
+    /// or let a client observe a stale version.
+    case delayedOldGeneration
+    /// The master crashes while a log is frozen: recovery must wait out the lock (and the
+    /// lease) on the frozen log or proceed with the others, and stay correct either way.
+    case logPauseDuringRecovery
 }
 
 /// Invariants checked continuously in every simulation.
@@ -199,6 +211,41 @@ func scheduleScenario(_ sim: Simulator, _ scenario: Scenario, monitor: Monitor, 
             sim.after(8_000_000) {
                 let stale = sim.roles(CommitProxy.self).filter { $0.generation <= gen && !$0.dead }
                 if !stale.isEmpty { sim.fail("old-generation proxies still running after reconnecting: \(stale.map(\.context.endpoint))") }
+            }
+        }
+
+    case .masterPause:
+        for round in 0..<4 {
+            at(1_500_000 + UInt64(round) * 2_500_000) {
+                guard let m = sim.roles(MasterRole.self).first(where: { $0.phase == .running }) else { return }
+                // Long enough for the controller to replace it (failure timeout) in some
+                // rounds, just past the lease in others.
+                let pause: UInt64 = round % 2 == 0 ? 2_000_000 : 450_000
+                sim.pause(m.context.processAddress, for: pause)
+            }
+        }
+
+    case .delayedOldGeneration:
+        for round in 0..<2 {
+            at(1_500_000 + UInt64(round) * 5_000_000) {
+                guard let m = sim.roles(MasterRole.self).first(where: { $0.phase == .running }) else { return }
+                let gen = m.generation
+                sim.holdOutgoing(m.context.processAddress, for: 3_000_000)
+                sim.after(4_000_000) {
+                    if !monitor.liveMasters.keys.contains(where: { $0 > gen }) {
+                        sim.fail("no new generation formed while generation \(gen)'s master was silenced")
+                    }
+                }
+            }
+        }
+
+    case .logPauseDuringRecovery:
+        for round in 0..<4 {
+            at(1_500_000 + UInt64(round) * 2_000_000) {
+                guard let m = sim.roles(MasterRole.self).first(where: { $0.phase == .running }),
+                      let log = pick(sim.logAddresses) else { return }
+                sim.killRole(m.context.endpoint)
+                sim.pause(log, for: 600_000)
             }
         }
 

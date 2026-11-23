@@ -399,6 +399,8 @@ public struct ClusterStatus: Hashable, Sendable, WireCodable {
 
 public struct ReadItem: Hashable, Sendable, WireCodable {
     public var key: Bytes
+    /// The version to read at, or 0 for "the latest version this replica has applied"
+    /// (answered with `ReadResult.valueAt`).
     public var version: Version
     public init(key: Bytes, version: Version) { self.key = key; self.version = version }
     public func encode(to w: inout WireWriter) { w.blob(key); w.u64(version) }
@@ -409,17 +411,21 @@ public struct ReadItem: Hashable, Sendable, WireCodable {
 public enum ReadResult: Hashable, Sendable, WireCodable {
     case value(Bytes?, Versionstamp)
     case error(ErrorCode)
+    /// A "latest" read: the value as of `version`, the replica's applied (committed) version.
+    case valueAt(Bytes?, Versionstamp, version: Version)
 
     public func encode(to w: inout WireWriter) {
         switch self {
         case .value(let v, let s): w.u8(1); w.optionalBlob(v); w.stamp(s)
         case .error(let e): w.u8(2); w.u16(e.rawValue)
+        case .valueAt(let v, let s, let ver): w.u8(3); w.optionalBlob(v); w.stamp(s); w.u64(ver)
         }
     }
     public init(from r: inout WireReader) throws {
         switch try r.u8() {
         case 1: self = .value(try r.optionalBlob(), try r.stamp())
         case 2: self = .error(ErrorCode(rawValue: try r.u16()) ?? .internalError)
+        case 3: self = .valueAt(try r.optionalBlob(), try r.stamp(), version: try r.u64())
         case let t: throw WireError("bad read result \(t)")
         }
     }

@@ -61,7 +61,9 @@ loses every replica and no generation loses every log:
 | Partition the controller's process | Lease step-down, re-election, fencing |
 | Kill a coordinator majority for 1–4 s | No progress without quorum, then recovery |
 | Partition a coordinator or log | Lock and recovery with unreachable participants |
+| Pause any process for 50–950 ms (GC / scheduler stall: nothing delivered, no timers, then everything released in order) | Leases outliving their holder, stale decisions surfacing late |
 | Latency storms (20 ms) | Timeouts, retries, duplicate requests |
+| Clock-rate skew: every process's clock runs at 0.92–1.08× real time | Lease margins under relative drift (see below) |
 | Scale-out: 3 storage servers join mid-run | Shard formation and live migration under faults |
 
 ## Targeted scenarios
@@ -78,10 +80,27 @@ loses every replica and no generation loses every log:
 | `storageFallsBehind` | Cut one replica off for 0.9 s, three times | It catches up from the logs (not replaced) and ends identical to its peers |
 | `oldGenerationReconnects` | Partition the running generation's master and proxies (keeping a coordinator majority reachable) | A new generation forms meanwhile; after healing the old roles stop without committing anything |
 | `coordinatorQuorumLoss` | Kill 2 of 3 coordinators for 5 s | No new generation forms without quorum; the running one keeps committing; recovery after they return |
+| `masterPause` | Freeze the running master for 0.45 s or 2 s, four times | A master that wakes with an expired lease never hands out a stale read version |
+| `delayedOldGeneration` | Hold everything the running master sends (lease renewals, read versions, forwarded resolutions) for 3 s while it keeps working, then release it all | A new generation forms meanwhile; the released messages can't extend old authority, change new state or give a client a stale version |
+| `logPauseDuringRecovery` | Crash the master while freezing a log (holding back its lock reply) | Recovery waits out the lease on the frozen log or proceeds with the others, correctly either way |
+
+### Timing assumptions
+
+Read versions are served by the master under leases granted by every log: 240 ms on the
+master's clock against 300 ms on the log's, the log's lease starting when it *receives* the
+renewal. That is safe if processes' monotonic clocks advance at rates within a factor of
+1.25 of each other (r_log / r_master ≤ 300/240). The simulator runs every process at a
+random rate in [0.92, 1.08] (worst relative ratio ≈ 1.17), pauses processes, and delays
+outgoing messages, so the protocol is tested inside its assumptions. Production uses
+`CLOCK_MONOTONIC` (NTP slews it by at most ±500 ppm). The simulator validates the protocol
+under these assumptions; it can't prove the real runtime meets them.
 
 ## Invariants checked in every run
 
 **Continuously (every 20 ms):**
+
+- After any acknowledged commit, a freshly obtained read version includes it (checked by the
+  history workload on every write).
 
 - At most one master ever completes recovery of a given generation.
 - Each generation's first version is above everything the previous generation committed.

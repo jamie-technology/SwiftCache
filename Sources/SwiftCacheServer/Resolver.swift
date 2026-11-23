@@ -125,7 +125,7 @@ public final class ResolverRole: Role {
         if req.version <= lastVersion {
             // A retry of something already resolved.
             if let cached = recentReplies[req.proxyIndex]?.first(where: { $0.version == req.version }) {
-                context.send(.resolveReply(rid: rid, cached.reply), to: from)
+                context.send(.resolveReply(rid: rid, cached.reply), to: req.replyTo.isEmpty ? from : req.replyTo)
             }
             return
         }
@@ -155,9 +155,9 @@ public final class ResolverRole: Role {
         if lastSeen.count >= Int(spec.proxyCount), let floor = lastSeen.values.min() {
             stateOps.removeAll { $0.version <= floor }
         }
-        let reply = ResolveReply(verdicts: verdicts, stateOps: relayed)
+        let reply = ResolveReply(version: req.version, prevVersion: req.prevVersion, verdicts: verdicts, stateOps: relayed)
         recentReplies[req.proxyIndex, default: []].append((req.version, reply))
         if recentReplies[req.proxyIndex]!.count > 64 { recentReplies[req.proxyIndex]!.removeFirst() }
-        context.send(.resolveReply(rid: rid, reply), to: from)
+        context.send(.resolveReply(rid: rid, reply), to: req.replyTo.isEmpty ? from : req.replyTo)
     }
 }

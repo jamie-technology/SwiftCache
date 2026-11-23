@@ -105,7 +105,7 @@ final class ClusterClient: Sendable {
         commitCoalescers.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512) { reqs in
+            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 4) { reqs in
                 do {
                     let reply = try await transport.request(to: endpoint, timeout: timeout) { .commitBatch(rid: $0, reqs) }
                     switch reply {
@@ -133,7 +133,7 @@ final class ClusterClient: Sendable {
         readCoalescers.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256) { items in
+            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 4) { items in
                 do {
                     let reply = try await transport.request(to: endpoint, timeout: timeout) { .readBatch(rid: $0, items: items) }
                     switch reply {
@@ -158,7 +158,10 @@ final class ClusterClient: Sendable {
     }
 
     private func fetchReadVersion() async throws -> Version {
-        let p = try await proxy()
+        // The master serves read versions in one round trip (under log leases); proxies
+        // can too (with per-request log confirmation) if no master is advertised.
+        let info = try await clientInfo()
+        let p = info.master.isEmpty ? try await proxy() : info.master
         let reply: Message
         do {
             reply = try await transport.request(to: p, timeout: options.requestTimeout) { .getReadVersion(rid: $0) }
@@ -254,7 +257,7 @@ final class ClusterClient: Sendable {
                     continue
                 }
                 switch result {
-                case .value(let value, let stamp):
+                case .value(let value, let stamp), .valueAt(let value, let stamp, _):
                     return (value, stamp)
                 case .error(.wrongShard):
                     stale = true
@@ -269,6 +272,15 @@ final class ClusterClient: Sendable {
             if !stale { try await transport.sleep(micros: 10_000 << UInt64(attempt)) }
         }
         throw lastError
+    }
+
+    /// Reads the latest value a replica of `key`'s shard has applied, with that version.
+    /// Returns nil if the replica can't answer (the caller falls back to a versioned read).
+    func readLatest(_ key: Bytes, topology topo: Topology) async -> (value: Bytes?, stamp: Versionstamp, version: Version)? {
+        guard let shard = topo.shard(forKey: key), !shard.replicas.isEmpty else { return nil }
+        let replica = shard.replicas[Int(transport.random(UInt64(shard.replicas.count)))]
+        guard case .valueAt(let v, let s, let ver)? = try? await readCoalescer(replica).submit(ReadItem(key: key, version: 0)) else { return nil }
+        return (v, s, ver)
     }
 
     /// Reads `[begin, end)` at `version` across all shards, merged in key order.

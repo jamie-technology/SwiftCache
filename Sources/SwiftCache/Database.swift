@@ -1,3 +1,4 @@
+import Synchronization
 import SwiftCacheCore
 
 /// A handle to a SwiftCache cluster.
@@ -19,6 +20,30 @@ import SwiftCacheCore
 public final class Database: Sendable {
     let client: ClusterClient
     public let options: DatabaseOptions
+    private let counters = Counters()
+
+    /// Client-side transaction statistics since this handle was created.
+    public struct Statistics: Sendable {
+        public var transactions: Int
+        public var retries: Int
+        public var conflicts: Int
+        public var tooOld: Int
+        public var unknownResults: Int
+    }
+
+    public var statistics: Statistics {
+        Statistics(transactions: counters.transactions.load(ordering: .relaxed), retries: counters.retries.load(ordering: .relaxed),
+                   conflicts: counters.conflicts.load(ordering: .relaxed), tooOld: counters.tooOld.load(ordering: .relaxed),
+                   unknownResults: counters.unknown.load(ordering: .relaxed))
+    }
+
+    final class Counters: Sendable {
+        let transactions = Atomic<Int>(0)
+        let retries = Atomic<Int>(0)
+        let conflicts = Atomic<Int>(0)
+        let tooOld = Atomic<Int>(0)
+        let unknown = Atomic<Int>(0)
+    }
 
     /// Creates a database handle over a custom transport (used by the simulator and tests).
     /// `coordinators` are `host:port` addresses of the cluster's coordinators.
@@ -66,6 +91,7 @@ public final class Database: Sendable {
 
     private func run<T>(pinnedVersion: Version? = nil, idempotent: Bool,
                         _ body: (Transaction) async throws -> T) async throws -> (result: T, versionstamp: Versionstamp?) {
+        counters.transactions.add(1, ordering: .relaxed)
         let operationID: Bytes? = idempotent ? randomID() : nil
         // Results of attempts whose commit outcome is unknown, by attempt id.
         var unknownAttempts: [UInt64: T] = [:]
@@ -91,10 +117,18 @@ public final class Database: Sendable {
                 }
             } catch let error as SwiftCacheError {
                 if error == .transactionTooOld { client.forgetRecentVersion() }
+                switch error {
+                case .notCommitted: counters.conflicts.add(1, ordering: .relaxed)
+                case .transactionTooOld: counters.tooOld.add(1, ordering: .relaxed)
+                case .commitUnknownResult: counters.unknown.add(1, ordering: .relaxed)
+                default: break
+                }
                 let retryable = error.isRetryable && !(pinnedVersion != nil && error == .transactionTooOld)
                 guard retryable else { throw error }
                 tries += 1
+                counters.retries.add(1, ordering: .relaxed)
                 if tries >= options.maxRetries { throw SwiftCacheError.retryLimitExceeded(last: error.description) }
+                if tries == 1 && error == .notCommitted { continue }  // retry a first conflict right away
                 let jitter = client.transport.random(backoff / 2 + 1)
                 try await client.transport.sleep(micros: backoff / 2 + jitter)
                 backoff = min(options.maxBackoff, backoff * 2)
@@ -133,7 +167,17 @@ public final class Database: Sendable {
         var backoff = options.initialBackoff
         while true {
             do {
+                // One round trip: ask for a read version and, in parallel, for the latest
+                // value a replica has applied (with its version A). If A ≥ the read version
+                // R, the read is linearized at A — a committed state no older than any
+                // commit acknowledged before this call, observed before the call returns.
+                // Otherwise (a lagging replica) read at R.
+                let topology = try await client.topology()
+                async let latest = client.readLatest(k, topology: topology)
                 let version = try await client.readVersion()
+                if let l = await latest, l.version >= version {
+                    return l.value.map { VersionedEntry(key: k, bytes: $0, versionstamp: l.stamp) }
+                }
                 let (value, stamp) = try await client.read(k, at: version)
                 return value.map { VersionedEntry(key: k, bytes: $0, versionstamp: stamp) }
             } catch let error as SwiftCacheError where error.isRetryable {

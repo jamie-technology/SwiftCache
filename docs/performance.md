@@ -11,16 +11,21 @@ Redis, `swiftcache-cli bench` for SwiftCache.
 
 | | Redis 7, 32 clients | SwiftCache, 32 | Redis 7, 256 clients | SwiftCache, 256 |
 | --- | --- | --- | --- | --- |
-| get | 147k ops/s, p50 0.10 ms | 44k, p50 0.68 ms | 165k, p50 0.77 ms | **178k**, p50 1.25 ms |
-| set | 69k ops/s | 22k, p50 1.30 ms | 151k, p50 0.79 ms | 55k, p50 3.9 ms |
-| 2-key read-modify-write txn | — | 9k | — | 33k |
+| get | 175k ops/s, p50 0.10 ms | 85k, p50 0.34 ms | 141k, p50 0.84 ms | **197k**, p50 1.10 ms |
+| set | 155k ops/s, p50 0.10 ms | 24k, p50 1.19 ms | 144k, p50 0.83 ms | 67k, p50 3.2 ms |
+| 2-key read-modify-write txn | — | 10.6k, p50 2.8 ms | — | 26k, p50 6.8 ms (p99.9 1.1 s, under investigation) |
 
 What is being compared: Redis is one process with no replication on the write path and no
 cross-key isolation. SwiftCache here is 3 shards × 2 replicas and 3 transaction logs, and
 every operation is strictly serializable:
 
-- a `get` obtains a read version confirmed by the master and every log;
+- a `get` is one round trip: a leased read version from the master in parallel with a
+  replica's latest committed value;
 - a `set` is a replicated transaction on 3 logs, plus an idempotency record.
+
+Open issue: the 2-key transaction benchmark at 256 clients regressed from the previous round
+(33k → 26k), with a 1.1 s p99.9. No recovery or failure happened during the run; the
+suspected cause is long conflict-retry chains with exponential backoff.
 
 ### Local cluster (no Docker networking)
 
@@ -28,11 +33,11 @@ every operation is strictly serializable:
 
 | | 32 clients | 128 | 512 |
 | --- | --- | --- | --- |
-| get | 53–76k ops/s | 201k | **387k** (p99 2.5 ms) |
-| set | 44k | 91k | 117k (p99 10 ms) |
-| 2-key txn | 20k | 37–40k | 73–86k |
+| get | 114–125k ops/s | 209k | **427k** (p99 2.3 ms) |
+| set | 43–58k | 97–101k | 159k (p99 7.5 ms) |
+| 2-key txn | 20–22k | 45–53k | 92–97k (p99 13.6 ms) |
 
-Single-client latency: get 0.15 ms, set 0.22 ms, 2-key txn 0.5 ms.
+Single-client latency: get 0.05 ms, set 0.17–0.21 ms, 2-key txn 0.42 ms.
 
 Throughput rises with concurrency because the system batches at every stage. Redis's
 single thread doesn't get that benefit.
@@ -67,26 +72,11 @@ Starting point: 4.6k gets/s and 11.8k sets/s at 32 clients, with gets slower tha
 | **Batched storage reads** (`readBatch`) | Concurrent reads to one storage server share a message | |
 | **Batched commits** (`commitBatch`) | Concurrent commits to one proxy share a message; each is still resolved and stamped individually | sets ×1.6, txns ×2+ at high concurrency |
 | Incremental resolver GC | The resolver swept its whole per-key map once a second, stalling commits | set p99.9 at 128 clients 66 ms → 6 ms |
-
-Correctness bugs caught while optimizing (both by the simulator, both fixed before
-keeping the change):
-
-- **Seeded logs weren't indexed for the demand-driven peek.** A long-poll timeout could have
-  told storage to skip data. Logs now always scan on timeout; the index only decides *when*
-  to answer.
-- A timed-out peek with no progress was re-held without a timer.
-
-## Where the remaining cost is
-
-Profiles show server time dominated by syscalls and message framing and decoding
-(`FrameDecoder` ≈ 12–15%), then the resolver and proxy finalization. A `set` touches the
-master twice, the resolver, all 3 logs, and 2 storage replicas (4 with its idempotency
-record).
-
-Next steps, roughly in order of payoff:
-
-1. **Zero-copy decode:** parse messages directly from NIO buffers (no `[UInt8]` copies); shorter endpoint encoding in frames.
-2. **Idempotency record co-location:** store the record with the transaction's first key (same shard), so a single-key `set` touches one shard instead of two.
-3. **More, smaller processes:** storage servers per core, more proxies, and partitioned resolvers; scaling out is how a cluster goes from hundreds of thousands to millions.
-4. **Pipelining the master's committed-version report** with the next batch.
-5. **Optional bounded-staleness reads** (opt-in, documented as not strictly serializable) for workloads that want Redis-like read latency at low concurrency.
+| Logs report durability straight to the master | The master's committed version is the minimum durable version across logs; proxies reply when the master says so (no proxy → master report round trip) | fewer hops per commit |
+| Version + resolution in one round trip | The master allocates the version and forwards the batch to a resolver on its own process, which replies to the proxy | −1 network round trip per commit |
+| Read versions from the master under log leases | No per-request log confirmation; one round trip; fenced by recovery locks that wait out the lease | read-version server CPU 4.4 → 0.7 µs/op |
+| One-round-trip single-key gets | Read version and a replica's latest committed value in parallel; used if the replica is at least as new | get p50 0.09 → 0.05 ms |
+| Continuous commit pipelining | A new batch starts when the previous one is resolved (not on a 1 ms timer) | set p50 and p99 down, batches 8 → 50–120 txns |
+| Multiple in-flight batches per client coalescer | Commits/reads no longer wait for the previous batch's full round trip | set at 512 clients 114k → 159k |
+| Immediate first retry after a conflict, 0.5 ms initial backoff | The conflicting writer already committed; a fresh read version usually succeeds | txn p99 at 512 clients 21 → 14 ms |
+| In-place frame decoding, cheap client RNG, one topology lookup per get | Fewer copies, syscalls and lock round trips | client CPU down |

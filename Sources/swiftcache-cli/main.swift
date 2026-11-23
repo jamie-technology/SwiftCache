@@ -230,16 +230,16 @@ struct Bench: AsyncParsableCommand {
         }
         let pinned = try await db.readVersion()
         let start = Date()
-        let end = start.addingTimeInterval(seconds)
         let results = try await withThrowingTaskGroup(of: (Int, Int, [Double]).self) { group in
             for _ in 0..<concurrency {
                 group.addTask {
                     var ops = 0, errors = 0
                     var latencies: [Double] = []
                     latencies.reserveCapacity(100_000)
-                    while Date() < end {
+                    let endNanos = DispatchTime.now().uptimeNanoseconds + UInt64(seconds * 1e9)
+                    while DispatchTime.now().uptimeNanoseconds < endNanos {
                         let k = "bench/\(Int.random(in: 0..<keys))"
-                        let t0 = Date()
+                        let t0 = DispatchTime.now().uptimeNanoseconds
                         do {
                             switch mode {
                             case "grv": _ = try await db.createTransaction().readVersion()
@@ -257,7 +257,7 @@ struct Bench: AsyncParsableCommand {
                                 if Double.random(in: 0..<1) < readRatio { _ = try await db.get(k) } else { try await db.set(k, value) }
                             }
                             ops += 1
-                            latencies.append(Date().timeIntervalSince(t0) * 1000)
+                            latencies.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
                         } catch { errors += 1 }
                     }
                     return (ops, errors, latencies)
@@ -273,5 +273,11 @@ struct Bench: AsyncParsableCommand {
         func pct(_ p: Double) -> String { lat.isEmpty ? "-" : String(format: "%.2f", lat[min(lat.count - 1, Int(Double(lat.count) * p))]) }
         print("\(mode): " + String(format: "%.0f ops/s", Double(ops) / elapsed)
               + "  p50=\(pct(0.5))ms p99=\(pct(0.99))ms p99.9=\(pct(0.999))ms  errors=\(errors)")
+        let st = db.statistics
+        if st.retries > 0 {
+            print(String(format: "   retries: %.1f%% of transactions (conflicts %d, too old %d, unknown %d, other %d)",
+                         100 * Double(st.retries) / Double(max(1, st.transactions)), st.conflicts, st.tooOld, st.unknownResults,
+                         st.retries - st.conflicts - st.tooOld - st.unknownResults))
+        }
     }
 }

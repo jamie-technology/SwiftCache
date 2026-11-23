@@ -32,11 +32,17 @@ struct FrameDecoder: ByteToMessageDecoder {
         guard Int(length) <= maxFrameSize else { throw WireError("frame too large: \(length)") }
         guard buffer.readableBytes >= 4 + Int(length) else { return .needMoreData }
         buffer.moveReaderIndex(forwardBy: 4)
-        var r = WireReader(buffer.readBytes(length: Int(length))!)
-        let from = try r.string()
-        let to = try r.string()
-        let message = try Message.decode(from: &r)
-        context.fireChannelRead(wrapInboundOut(Frame(from: from, to: to, message: message)))
+        // Decode straight out of the receive buffer (no intermediate copy).
+        let frame = try buffer.withUnsafeReadableBytes { raw -> Frame in
+            var r = WireReader(UnsafeRawBufferPointer(rebasing: raw[0..<Int(length)]))
+            let from = try r.string()
+            let to = try r.string()
+            let message = try Message.decode(from: &r)
+            guard r.isAtEnd else { throw WireError("trailing bytes in \(message.name)") }
+            return Frame(from: from, to: to, message: message)
+        }
+        buffer.moveReaderIndex(forwardBy: Int(length))
+        context.fireChannelRead(wrapInboundOut(frame))
         return .continue
     }
 }

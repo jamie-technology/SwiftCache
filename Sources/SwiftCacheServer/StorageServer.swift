@@ -474,7 +474,7 @@ public final class StorageServer: Role {
     /// Answers many reads at once: waits (once) for the highest version among them, then
     /// evaluates each exactly like a single read.
     private func handleReadBatch(rid: UInt64, items: [ReadItem], from: Endpoint) {
-        let maxVersion = items.map(\.version).max() ?? 0
+        let maxVersion = items.map(\.version).max() ?? 0  // "latest" items (0) never wait
         if tag != 0, shardID >= 0, maxVersion > applied {
             wait(for: maxVersion, then: { [weak self] in
                 self?.handleReadBatch(rid: rid, items: items, from: from)
@@ -490,6 +490,15 @@ public final class StorageServer: Role {
     private func answerReadBatch(rid: UInt64, items: [ReadItem], from: Endpoint) {
         let results = items.map { item -> ReadResult in
             if tag == 0 || shardID < 0 { return .error(.wrongShard) }
+            if item.version == 0 {
+                // Latest applied: everything applied is committed (logs only hand out
+                // committed versions), so this is a consistent, committed state.
+                guard owned.contains(Slots.slot(for: item.key)), applied > 0 else { return .error(.wrongShard) }
+                if let v = store.get(item.key, at: applied), let value = v.visibleValue(at: applied) {
+                    return .valueAt(value, v.stamp, version: applied)
+                }
+                return .valueAt(nil, .zero, version: applied)
+            }
             if item.version < oldestReadable { return .error(.transactionTooOld) }
             if item.version > applied { return .error(.futureVersion) }
             guard owned.contains(Slots.slot(for: item.key)) else { return .error(.wrongShard) }

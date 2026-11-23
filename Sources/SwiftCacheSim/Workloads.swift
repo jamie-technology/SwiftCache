@@ -30,6 +30,9 @@ public struct SimulationOptions: Sendable {
     public var chaos = true
     /// Include faults that hit the transaction system (roles, logs, controller, coordinators).
     public var transactionSystemFaults = true
+    /// Per-process clock-rate skew (±). Safety must hold for any skew within the lease
+    /// margin (20%).
+    public var clockSkew = 0.08
     public var verbose = false
     /// Run a targeted fault scenario instead of random chaos.
     public var scenario: Scenario?
@@ -68,6 +71,7 @@ public func runSimulation(seed: UInt64, options: SimulationOptions = SimulationO
     config.shardLossTimeout = 20_000_000
     if ProcessInfo.processInfo.environment["SIM_NO_HALT_STRAY"] != nil { config.haltStrayRoles = false }
     let sim = Simulator(seed: seed, config: config)
+    sim.clockSkew = options.clockSkew
     sim.verbose = options.verbose
     sim.addCoordinators(options.coordinators)
     for _ in 0..<options.logProcesses { sim.addProcess(.log) }
@@ -275,7 +279,10 @@ func scheduleChaos(_ sim: Simulator, options: SimulationOptions, until end: UInt
             if healthy(), let v = pick(sim.coordinatorAddresses + sim.logAddresses) {
                 sim.partition(v, for: 50_000 + sim.random.below(1_500_000))
             }
-        } else if roll < 88 {
+        } else if roll < 84 {
+            // A process stalls (GC / scheduler pause), possibly past its leases.
+            if let v = pick(sim.allAddresses) { sim.pause(v, for: 50_000 + sim.random.below(900_000)) }
+        } else if roll < 90 {
             sim.network.maxLatency = 20_000
             sim.after(1_000_000) { sim.network.maxLatency = 2_000 }
         }
@@ -464,6 +471,10 @@ func historyWorkload(_ sim: Simulator, _ db: Database, _ counters: Counters, cli
             let value = i
             let stamp = try await db.set(key, value, ttl: sim.random.chance(0.1) ? 0.5 : nil)
             recordStamp(sim, counters, stamp, "history")
+            // Strict serializability: a read version obtained after an acknowledged commit
+            // must include it.
+            let rv = try await db.readVersion()
+            if rv < stamp.version { sim.fail("history: read version \(rv) after commit at \(stamp.version) (stale)") }
             if stamp <= lastStamp { sim.fail("history: versionstamps not increasing \(lastStamp) -> \(stamp)") }
             lastStamp = stamp
             written.append((value, stamp))

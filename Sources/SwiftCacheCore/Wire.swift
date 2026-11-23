@@ -34,50 +34,60 @@ public struct WireError: Error, CustomStringConvertible, Sendable {
     public init(_ d: String) { description = d }
 }
 
+/// Reads the wire format directly from memory (no intermediate copies). A reader is only
+/// valid inside the scope that provides its buffer (`WireReader.read(_:_:)` or
+/// `withUnsafeReadableBytes`); every decoded value is an owned copy.
 public struct WireReader {
-    let bytes: Bytes
+    let base: UnsafeRawBufferPointer
     var offset: Int
 
-    public init(_ bytes: Bytes) { self.bytes = bytes; self.offset = 0 }
+    public init(_ buffer: UnsafeRawBufferPointer) { self.base = buffer; self.offset = 0 }
 
-    public var isAtEnd: Bool { offset >= bytes.count }
+    /// Runs `body` with a reader over `bytes`.
+    public static func read<T>(_ bytes: Bytes, _ body: (inout WireReader) throws -> T) rethrows -> T {
+        try bytes.withUnsafeBytes { buf in
+            var r = WireReader(buf)
+            return try body(&r)
+        }
+    }
 
+    public var isAtEnd: Bool { offset >= base.count }
+
+    @inline(__always)
     mutating func need(_ n: Int) throws {
-        if n < 0 || offset + n > bytes.count { throw WireError("truncated message (need \(n) at \(offset) of \(bytes.count))") }
+        if n < 0 || n > base.count - offset { throw WireError("truncated message (need \(n) at \(offset) of \(base.count))") }
     }
 
-    public mutating func u8() throws -> UInt8 { try need(1); defer { offset += 1 }; return bytes[offset] }
+    @inline(__always)
+    private mutating func load<T: FixedWidthInteger>(_: T.Type) throws -> T {
+        try need(MemoryLayout<T>.size)
+        let v = base.loadUnaligned(fromByteOffset: offset, as: T.self)
+        offset += MemoryLayout<T>.size
+        return T(littleEndian: v)
+    }
+
+    public mutating func u8() throws -> UInt8 { try load(UInt8.self) }
     public mutating func bool() throws -> Bool { try u8() != 0 }
-    public mutating func u16() throws -> UInt16 {
-        try need(2); defer { offset += 2 }
-        return UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
-    }
-    public mutating func u32() throws -> UInt32 {
-        try need(4); defer { offset += 4 }
-        var v: UInt32 = 0
-        for i in 0..<4 { v |= UInt32(bytes[offset + i]) << (8 * UInt32(i)) }
-        return v
-    }
-    public mutating func u64() throws -> UInt64 {
-        try need(8); defer { offset += 8 }
-        var v: UInt64 = 0
-        for i in 0..<8 { v |= UInt64(bytes[offset + i]) << (8 * UInt64(i)) }
-        return v
-    }
+    public mutating func u16() throws -> UInt16 { try load(UInt16.self) }
+    public mutating func u32() throws -> UInt32 { try load(UInt32.self) }
+    public mutating func u64() throws -> UInt64 { try load(UInt64.self) }
     public mutating func i32() throws -> Int32 { Int32(bitPattern: try u32()) }
     public mutating func i64() throws -> Int64 { Int64(bitPattern: try u64()) }
-    public mutating func blob() throws -> Bytes {
+
+    private mutating func span() throws -> UnsafeRawBufferPointer {
         let n = Int(try u32())
         try need(n)
         defer { offset += n }
-        return Array(bytes[offset..<(offset + n)])
+        return UnsafeRawBufferPointer(rebasing: base[offset..<(offset + n)])
     }
-    public mutating func string() throws -> String { try blob().utf8String }
+
+    public mutating func blob() throws -> Bytes { Bytes(try span()) }
+    public mutating func string() throws -> String { String(decoding: try span(), as: UTF8.self) }
     public mutating func optionalBlob() throws -> Bytes? { try bool() ? try blob() : nil }
     public mutating func stamp() throws -> Versionstamp { Versionstamp(version: try u64(), order: try u16()) }
     public mutating func array<T>(_ each: (inout WireReader) throws -> T) throws -> [T] {
         let n = Int(try u32())
-        guard n <= bytes.count - offset else { throw WireError("array length \(n) exceeds message") }
+        guard n <= base.count - offset else { throw WireError("array length \(n) exceeds message") }
         var out = [T]()
         out.reserveCapacity(n)
         for _ in 0..<n { out.append(try each(&self)) }
@@ -86,6 +96,7 @@ public struct WireReader {
     public mutating func slots() throws -> SlotSet {
         let n = Int(try u32())
         var ranges = [(start: Int, end: Int)]()
+        ranges.reserveCapacity(n)
         for _ in 0..<n {
             let a = Int(try u16()), len = Int(try u16())
             ranges.append((a, a + len))

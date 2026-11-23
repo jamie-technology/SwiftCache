@@ -56,8 +56,13 @@ public final class MasterRole: Role {
     /// Each proxy's requests are served strictly in request-number order (retries can
     /// arrive out of order), so a proxy's batches are always in version order.
     private var nextRequest: [UInt32: UInt64] = [:]
-    private var heldRequests: [UInt32: [UInt64: (rid: UInt64, from: Endpoint)]] = [:]
+    private var heldRequests: [UInt32: [UInt64: (rid: UInt64, from: Endpoint, resolve: ResolveRequest?)]] = [:]
     private var lastProgress: UInt64 = 0
+    /// Read versions are served only while every log has granted us a lease.
+    private var leaseValidUntil: UInt64 = 0
+    private var grvWaiters: [(client: Endpoint, rid: UInt64)] = []
+    /// Durable version reported by each log of this generation.
+    private var logDurable: [Endpoint: Version] = [:]
     private var lastProgressCommitted: Version = 0
 
     init(context: RoleContext, config: ClusterConfig, spec: MasterSpec, coordinators: [Endpoint]) {
@@ -188,6 +193,12 @@ public final class MasterRole: Role {
     /// committed but not yet applied by storage is lost. Continue from what storage has.
     private func forcedRecovery(_ old: CoreState) {
         context.log(.error, "every log of generation \(old.generation) is gone; forcing recovery (unapplied commits are lost)")
+        // No log can delay us until the old master's read-version lease lapses, so wait it out.
+        context.schedule(after: config.readVersionLease) { [weak self] in self?.continueForcedRecovery(old) }
+    }
+
+    private func continueForcedRecovery(_ old: CoreState) {
+        guard phase == .lockingLogs else { return }
         recoveryVersion = max(old.startVersion, spec.fallbackVersion)
         highestOldVersion = recoveryVersion
         seedFrom = []
@@ -207,11 +218,15 @@ public final class MasterRole: Role {
         phase = .recruiting
         let offset = Int(spec.recoveryID % 7)
         let logWorkers = pick(spec.logWorkers, Int(spec.logReplicas), offset: offset)
-        let resolverWorkers = pick(spec.statelessWorkers, Int(spec.resolvers), offset: offset)
+        // Put the (first) resolver on this process: version allocation forwards each batch to
+        // it, so resolution costs no extra network hop.
+        let myWorker = ServerProcess.workerEndpoint(context.processAddress)
+        var resolverWorkers = pick(spec.statelessWorkers, Int(spec.resolvers), offset: offset)
+        if spec.statelessWorkers.contains(myWorker), !resolverWorkers.isEmpty { resolverWorkers[0] = myWorker }
         guard !logWorkers.isEmpty, !resolverWorkers.isEmpty else { return fail("not enough workers") }
         let forcedTags = seedFrom.isEmpty && oldState != nil ? shardMap.allTags : []
         let tlogSpec = RoleSpec.tlog(TLogSpec(generation: generation, startVersion: recoveryVersion, seedFrom: seedFrom,
-                                              initialTags: forcedTags))
+                                              initialTags: forcedTags, master: context.endpoint))
         let resolverSpec = RoleSpec.resolver(ResolverSpec(generation: generation, startVersion: recoveryVersion,
                                                            proxyCount: spec.proxies))
         recruitAll(logWorkers.map { ($0, tlogSpec) } + resolverWorkers.map { ($0, resolverSpec) }) { [weak self] endpoints in
@@ -281,8 +296,11 @@ public final class MasterRole: Role {
             guard let endpoints else { return self.fail("recruiting proxies failed") }
             self.proxies = endpoints
             self.phase = .running
+            for p in endpoints { self.context.send(.committedVersion(generation: self.generation, version: self.committed), to: p) }
             self.lastProgress = self.context.now
             self.context.every(500_000) { [weak self] in self?.checkStall() }
+            self.renewLease()
+            self.context.every(self.config.leaseRenewInterval) { [weak self] in self?.renewLease() }
             let result = RecoveryResult(recoveryID: self.spec.recoveryID, generation: self.generation, master: self.context.endpoint,
                                         proxies: endpoints, resolvers: self.resolvers, tlogs: self.tlogs,
                                         shardMap: self.shardMap, startVersion: self.recoveryVersion)
@@ -312,37 +330,111 @@ public final class MasterRole: Role {
         }
     }
 
+    // MARK: Read versions (leased)
+
+    private func renewLease() {
+        let sentAt = context.now
+        var acks = 0
+        let logs = tlogs
+        for t in logs {
+            context.request(to: t, timeout: config.leaseRenewInterval * 2, { .tlogLease(rid: $0, generation: self.generation) }) { [weak self] reply in
+                guard let self, case .ack? = reply else { return }
+                acks += 1
+                guard acks == logs.count else { return }
+                // Each log's lease runs from when it *received* our request (≥ sentAt), so
+                // ours, measured from sentAt and shortened for clock-rate drift, ends first.
+                self.leaseValidUntil = max(self.leaseValidUntil, sentAt + self.config.readVersionLease * 4 / 5)
+                self.answerReadVersions()
+            }
+        }
+    }
+
+    private var leaseValid: Bool { context.now < leaseValidUntil }
+
+    private func answerReadVersions() {
+        guard leaseValid, !grvWaiters.isEmpty else { return }
+        let waiting = grvWaiters
+        grvWaiters = []
+        for w in waiting { context.send(.readVersionReply(rid: w.rid, version: committed), to: w.client) }
+    }
+
     // MARK: Sequencer
+
+    /// Allocates commit versions to each proxy strictly in request-number order (retries
+    /// can arrive out of order), replays cached allocations for retries, and either
+    /// replies with the version or forwards the batch to the resolver with it.
+    private func allocate(rid: UInt64, proxy: UInt32, num: UInt64, from: Endpoint, resolve: ResolveRequest?) {
+        // Proxies start asking as soon as they're recruited (CoreState is written by then).
+        guard phase == .running || phase == .recruitingProxies else { return context.send(.errorReply(rid: rid, .unavailable), to: from) }
+        if let cached = replies[proxy]?[num] {
+            answer(rid: rid, from: from, prev: cached.prev, version: cached.version, resolve: resolve)
+            return
+        }
+        let expected = nextRequest[proxy] ?? 0
+        guard num >= expected else { return }  // ancient retry whose reply was evicted
+        heldRequests[proxy, default: [:]][num] = (rid, from, resolve)
+        var next = expected
+        while let held = heldRequests[proxy]?.removeValue(forKey: next) {
+            let version = max(lastVersion + 1, minNextVersion, context.versionClock)
+            let prev = lastVersion
+            lastVersion = version
+            if firstVersion == 0 { firstVersion = version }
+            replies[proxy, default: [:]][next] = (prev, version)
+            if next >= 256 { replies[proxy]![next - 256] = nil }
+            answer(rid: held.rid, from: held.from, prev: prev, version: version, resolve: held.resolve)
+            next += 1
+        }
+        nextRequest[proxy] = next
+    }
+
+    private func answer(rid: UInt64, from: Endpoint, prev: Version, version: Version, resolve: ResolveRequest?) {
+        guard var req = resolve else {
+            return context.send(.commitVersionReply(rid: rid, prevVersion: prev, version: version), to: from)
+        }
+        guard let resolver = resolvers.first else { return }
+        req.version = version
+        req.prevVersion = prev
+        req.replyTo = from
+        context.send(.resolve(rid: rid, req), to: resolver)
+    }
 
     public func receive(_ message: Message, from: Endpoint) {
         switch message {
         case .getCommitVersion(let rid, let proxy, let num):
-            // Proxies start asking as soon as they're recruited (CoreState is written by then).
-            guard phase == .running || phase == .recruitingProxies else { return context.send(.errorReply(rid: rid, .unavailable), to: from) }
-            if let cached = replies[proxy]?[num] {
-                context.send(.commitVersionReply(rid: rid, prevVersion: cached.prev, version: cached.version), to: from)
-                return
-            }
-            let expected = nextRequest[proxy] ?? 0
-            guard num >= expected else { return }  // ancient retry whose reply was evicted
-            heldRequests[proxy, default: [:]][num] = (rid, from)
-            // Serve this proxy's requests in order, as far as they're contiguous.
-            var next = expected
-            while let held = heldRequests[proxy]?.removeValue(forKey: next) {
-                let version = max(lastVersion + 1, minNextVersion, context.versionClock)
-                let prev = lastVersion
-                lastVersion = version
-                if firstVersion == 0 { firstVersion = version }
-                replies[proxy, default: [:]][next] = (prev, version)
-                if next >= 256 { replies[proxy]![next - 256] = nil }
-                context.send(.commitVersionReply(rid: held.rid, prevVersion: prev, version: version), to: held.from)
-                next += 1
-            }
-            nextRequest[proxy] = next
+            allocate(rid: rid, proxy: proxy, num: num, from: from, resolve: nil)
+
+        case .versionAndResolve(let rid, let num, let req):
+            guard req.generation == generation else { return context.send(.errorReply(rid: rid, .staleGeneration), to: from) }
+            allocate(rid: rid, proxy: req.proxyIndex, num: num, from: from, resolve: req)
 
         case .reportCommitted(let rid, let version):
             committed = max(committed, version)
             context.send(.ack(rid: rid), to: from)
+
+        case .tlogDurable(let gen, let version):
+            guard gen == generation, phase == .running || phase == .recruitingProxies, tlogs.contains(from) else { return }
+            logDurable[from] = max(logDurable[from] ?? 0, version)
+            guard logDurable.count == tlogs.count, let minDurable = logDurable.values.min(), minDurable > committed else { return }
+            // Everything up to minDurable is on every log of the generation: committed.
+            committed = minDurable
+            for p in proxies { context.send(.committedVersion(generation: generation, version: committed), to: p) }
+            for t in tlogs { context.send(.tlogCommitted(generation: generation, version: committed), to: t) }
+
+        case .getReadVersion(let rid):
+            // Every commit acknowledged to any client is ≤ committed (proxies reply only
+            // after we declare a version committed), and while our lease holds no newer
+            // generation can exist. One round trip, no per-request log confirmation.
+            guard phase == .running else { return context.send(.errorReply(rid: rid, .unavailable), to: from) }
+            if leaseValid {
+                context.send(.readVersionReply(rid: rid, version: committed), to: from)
+            } else {
+                grvWaiters.append((from, rid))
+                context.schedule(after: config.requestTimeout) { [weak self] in
+                    guard let self, let i = self.grvWaiters.firstIndex(where: { $0.rid == rid && $0.client == from }) else { return }
+                    self.grvWaiters.remove(at: i)
+                    self.context.send(.errorReply(rid: rid, .unavailable), to: from)
+                }
+            }
 
         case .getLiveCommitted(let rid):
             guard phase == .running || phase == .recruitingProxies else { return context.send(.errorReply(rid: rid, .unavailable), to: from) }

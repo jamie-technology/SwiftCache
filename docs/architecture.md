@@ -32,10 +32,10 @@ it recovers into a new generation, fencing the old one.
 | --- | --- | --- | --- | --- |
 | **Coordinator** | 3 or 5 (configured) | Elects the controller; stores `CoreState` (current generation and its logs) in a single-decree Paxos register | Ballots: a coordinator never accepts a write below a ballot it has promised | Register persisted to disk (fsync) |
 | **Cluster controller** | 1, elected | Worker registry, failure detection, recruiting masters, data distribution, publishing cluster info | Its lease. It steps down before coordinators can elect another. The hard fence is that it can only change things through a generation, and old generations are locked | Rebuilt from worker registrations and the recovered shard map |
-| **Master** | 1 per generation | Runs recovery, then allocates commit versions and tracks the committed version | Must write `CoreState` with its ballot before the generation goes live. A newer recovery's promise makes that write fail | In memory |
-| **Commit proxy** | N per generation | Batches commits, routes mutations to logs, writes idempotency records, serves read versions | Pushes go to logs that refuse once locked. Read versions require every log to confirm it's unlocked | Transient |
+| **Master** | 1 per generation | Runs recovery, allocates commit versions (forwarding batches to the resolver), tracks the committed version from the logs' durability reports, serves read versions under log leases | Must write `CoreState` with its ballot before the generation goes live. A newer recovery's promise makes that write fail | In memory |
+| **Commit proxy** | N per generation | Batches commits, routes mutations to logs, writes idempotency records | Pushes go to logs that refuse once locked. Read versions require every log to confirm it's unlocked | Transient |
 | **Resolver** | 1 per generation | Decides conflicts in version order. Relays metadata changes between proxies | Rejects read versions from before its generation started | Per generation |
-| **Transaction log** | L per generation | Durability: a version is committed when *every* log of the generation has it | Locked by the next recovery | In memory |
+| **Transaction log** | L per generation | Durability: a version is committed when *every* log of the generation has it. Grants the master's read-version lease | Locked by the next recovery (whose lock reply waits out the lease) | In memory |
 | **Storage server** | shards × replicas | Holds data and serves multi-version reads | Only ever applies versions the logs report as committed | In memory |
 
 Every role is its own state machine with its own lifecycle. A *process* (one
@@ -51,27 +51,42 @@ unreachable one (must wait).
 
 ## The commit path
 
-1. A client gets a **read version** from any proxy of the current generation. The proxy asks
-   the master for the committed version *and* confirms with every log that the generation
-   is unlocked. A proxy of a superseded generation can never hand out a stale read version.
+1. A client gets a **read version** from the **master**, in one round trip. The master
+   answers from memory while it holds a **lease** from every log of its generation (renewed
+   every 75 ms, 300 ms long). A log that is asked to lock for a recovery stops accepting
+   pushes at once, but holds back its lock reply until the lease it granted has expired. A
+   superseded master's lease therefore always runs out before a new generation can go live,
+   and it can never hand out a stale read version. (Proxies can also serve read versions,
+   confirming with every log per request, if a client has no master address.)
 2. The client reads directly from storage replicas at that version, buffering writes locally.
-3. The client sends the commit (read version, read/write conflict ranges, mutations,
-   optional idempotency id) to any proxy.
-4. The proxy batches commits (every 1 ms) and asks the master for `(prevVersion, version)`.
-   Versions follow the wall clock in µs and never go backwards.
-5. The proxy sends the batch's conflict ranges to the resolver. The resolver decides each
-   transaction in version order, so later transactions in a batch see earlier ones. It also
-   returns any metadata other proxies committed in between, so every proxy routes
-   identically.
-6. The proxy tags each mutation with the tags of the storage servers that own its slot (both
-   owners during a migration). It then pushes the version to **every** log. Logs append
-   strictly in `prevVersion` order.
-7. Once every log has acknowledged, the proxy reports the version to the master, waits for
-   its acknowledgement, and only then replies to clients. Any read version handed out after
-   a client hears "committed" therefore includes that commit.
-8. Storage servers long-poll ("peek") their tag from a log. Logs only expose versions known
-   to be on every log, so storage never applies anything that recovery could discard.
-   Storage pops what it has applied.
+3. The client sends the commit to a commit proxy. Concurrent commits from one client process
+   share a `commitBatch` message; each is still resolved and stamped individually.
+4. The proxy pipelines batches continuously: a new batch starts as soon as the previous one
+   has its resolution, taking everything that arrived meanwhile, so batch size adapts to
+   load and no commit waits on a timer. For each batch it sends one `versionAndResolve` to
+   the master. The master allocates `(prevVersion, version)` strictly in the proxy's
+   request order and forwards the batch's conflict ranges to the resolver, which runs on
+   the master's process (no extra network hop). The resolver decides each transaction in
+   version order and replies **directly to the proxy** with the version, the verdicts, and
+   any metadata other proxies committed in between.
+5. The proxy tags each mutation with the tags of the storage servers that own its slot (both
+   owners during a migration) and pushes the version to **every** log. Logs append strictly
+   in `prevVersion` order.
+6. Each log reports its durable version **to the master**. The master's committed version is
+   the minimum durable version across the generation's logs. The master notifies proxies,
+   which reply to their clients, and logs, which make the version visible to storage. A
+   client is therefore only told "committed" once every log has the commit **and** the
+   master, which hands out read versions, knows it.
+7. Storage servers long-poll ("peek") their tag from a log. A log answers when the tag has
+   new committed data, when a waiting read needs a newer version, or when the replica would
+   otherwise fall more than 1 ms behind. Logs only expose committed versions, so storage
+   never applies anything a recovery could discard.
+
+**Single-key gets** take one round trip. The client asks the master for a read version R
+and, in parallel, asks a replica for its latest applied (committed) value and version A.
+If A ≥ R, that value is returned: the read is linearized at A, a committed state no older
+than any commit acknowledged before the call, observed before the call returns. Otherwise
+the client falls back to a read at R. Multi-key transactions always read one snapshot.
 
 A commit has two possible outcomes per transaction: committed with versionstamp
 `(version, order)`, or failed (`not_committed`, `transaction_too_old`, `unavailable`). If
@@ -94,7 +109,12 @@ redundancy can be restored, for example 3 logs again after running on 2. The mas
      log answered.
    - Every old log definitively gone (all restarted): unapplied commits are lost (in-memory,
      like losing every replica of a shard). The cluster continues from what storage has
-     applied.
+     applied, after first waiting out one read-version lease period, since no surviving log
+     can delay it for the old master's lease.
+
+   A lock reply is held until the read-version lease that log granted has expired, which
+   adds up to 300 ms to recovery but guarantees the old master has stopped serving read
+   versions.
 3. **Rebuilds the shard map** from the metadata tag of a locked log, and **recruits new
    logs** seeded with the old logs' unreleased data (everything ≤ the recovery version that
    storage hasn't popped yet), plus a resolver.

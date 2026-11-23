@@ -41,7 +41,7 @@ public struct CoreState: Hashable, Sendable, WireCodable {
         generation = try r.u64(); tlogs = try r.strings(); startVersion = try r.u64()
     }
     public var bytes: Bytes { var w = WireWriter(); w.put(self); return w.bytes }
-    public init(bytes: Bytes) throws { var r = WireReader(bytes); self = try r.get() }
+    public init(bytes: Bytes) throws { self = try WireReader.read(bytes) { try $0.get() } }
 }
 
 public enum ProcessClass: UInt8, Sendable, CustomStringConvertible {
@@ -110,11 +110,15 @@ public struct ClientInfo: Hashable, Sendable, WireCodable {
     public var generation: UInt64
     public var proxies: [Endpoint]
     public var topology: Topology
-    public init(generation: UInt64, proxies: [Endpoint], topology: Topology) {
-        self.generation = generation; self.proxies = proxies; self.topology = topology
+    /// Serves read versions (under log leases).
+    public var master: Endpoint
+    public init(generation: UInt64, proxies: [Endpoint], topology: Topology, master: Endpoint = "") {
+        self.generation = generation; self.proxies = proxies; self.topology = topology; self.master = master
     }
-    public func encode(to w: inout WireWriter) { w.u64(generation); w.strings(proxies); w.put(topology) }
-    public init(from r: inout WireReader) throws { generation = try r.u64(); proxies = try r.strings(); topology = try r.get() }
+    public func encode(to w: inout WireWriter) { w.u64(generation); w.strings(proxies); w.put(topology); w.string(master) }
+    public init(from r: inout WireReader) throws {
+        generation = try r.u64(); proxies = try r.strings(); topology = try r.get(); master = try r.string()
+    }
 }
 
 /// A storage server's self-report, sent with its worker's registration.
@@ -190,12 +194,16 @@ public struct TLogSpec: Hashable, Sendable, WireCodable {
     public var seedFrom: [Endpoint]
     /// Forced recovery only: storage tags that continue from `startVersion`.
     public var initialTags: [Tag]
-    public init(generation: UInt64, startVersion: Version, seedFrom: [Endpoint], initialTags: [Tag] = []) {
-        self.generation = generation; self.startVersion = startVersion; self.seedFrom = seedFrom; self.initialTags = initialTags
+    /// The master of the generation (logs report durability to it).
+    public var master: Endpoint
+    public init(generation: UInt64, startVersion: Version, seedFrom: [Endpoint], initialTags: [Tag] = [], master: Endpoint = "") {
+        self.generation = generation; self.startVersion = startVersion; self.seedFrom = seedFrom
+        self.initialTags = initialTags; self.master = master
     }
-    public func encode(to w: inout WireWriter) { w.u64(generation); w.u64(startVersion); w.strings(seedFrom); w.u32s(initialTags) }
+    public func encode(to w: inout WireWriter) { w.u64(generation); w.u64(startVersion); w.strings(seedFrom); w.u32s(initialTags); w.string(master) }
     public init(from r: inout WireReader) throws {
         generation = try r.u64(); startVersion = try r.u64(); seedFrom = try r.strings(); initialTags = try r.u32s()
+        master = try r.string()
     }
 }
 
@@ -454,17 +462,21 @@ public struct ResolveRequest: Hashable, Sendable, WireCodable {
     public var txns: [ResolveTxn]
     /// Metadata ops committed (unconditionally) in this batch.
     public var metaOps: [MetaOp]
+    /// Where the resolver sends its reply (the proxy, when the master forwarded the
+    /// request; empty = reply to the sender).
+    public var replyTo: Endpoint
     public init(generation: UInt64, proxyIndex: UInt32, version: Version, prevVersion: Version, lastSeenVersion: Version,
-                txns: [ResolveTxn], metaOps: [MetaOp]) {
+                txns: [ResolveTxn], metaOps: [MetaOp], replyTo: Endpoint = "") {
         self.generation = generation; self.proxyIndex = proxyIndex; self.version = version; self.prevVersion = prevVersion
-        self.lastSeenVersion = lastSeenVersion; self.txns = txns; self.metaOps = metaOps
+        self.lastSeenVersion = lastSeenVersion; self.txns = txns; self.metaOps = metaOps; self.replyTo = replyTo
     }
     public func encode(to w: inout WireWriter) {
         w.u64(generation); w.u32(proxyIndex); w.u64(version); w.u64(prevVersion); w.u64(lastSeenVersion); w.put(txns); w.put(metaOps)
+        w.string(replyTo)
     }
     public init(from r: inout WireReader) throws {
         generation = try r.u64(); proxyIndex = try r.u32(); version = try r.u64(); prevVersion = try r.u64()
-        lastSeenVersion = try r.u64(); txns = try r.getArray(); metaOps = try r.getArray()
+        lastSeenVersion = try r.u64(); txns = try r.getArray(); metaOps = try r.getArray(); replyTo = try r.string()
     }
 }
 
@@ -477,11 +489,18 @@ public struct StateOps: Hashable, Sendable, WireCodable {
 }
 
 public struct ResolveReply: Hashable, Sendable, WireCodable {
+    /// The batch's commit version and the version before it.
+    public var version: Version
+    public var prevVersion: Version
     /// Per transaction: 0 commit, 1 conflict, 2 too old.
     public var verdicts: [UInt8]
     /// Metadata committed by other proxies at versions in (lastSeenVersion, version).
     public var stateOps: [StateOps]
-    public init(verdicts: [UInt8], stateOps: [StateOps]) { self.verdicts = verdicts; self.stateOps = stateOps }
-    public func encode(to w: inout WireWriter) { w.array(verdicts) { $0.u8($1) }; w.put(stateOps) }
-    public init(from r: inout WireReader) throws { verdicts = try r.array { try $0.u8() }; stateOps = try r.getArray() }
+    public init(version: Version, prevVersion: Version, verdicts: [UInt8], stateOps: [StateOps]) {
+        self.version = version; self.prevVersion = prevVersion; self.verdicts = verdicts; self.stateOps = stateOps
+    }
+    public func encode(to w: inout WireWriter) { w.u64(version); w.u64(prevVersion); w.array(verdicts) { $0.u8($1) }; w.put(stateOps) }
+    public init(from r: inout WireReader) throws {
+        version = try r.u64(); prevVersion = try r.u64(); verdicts = try r.array { try $0.u8() }; stateOps = try r.getArray()
+    }
 }

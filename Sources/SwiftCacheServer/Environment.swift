@@ -73,7 +73,15 @@ public struct ClusterConfig: Sendable, Hashable {
     /// Default timeout for role-to-role requests.
     public var requestTimeout: UInt64 = 1_000_000
 
+    /// Read-version lease the master holds on every log. A recovery lock waits out the
+    /// lease, so a superseded master can never hand out a stale read version.
+    public var readVersionLease: UInt64 = 300_000
+    public var leaseRenewInterval: UInt64 = 75_000
+
     // Storage.
+    /// A replica with no new data still advances at least this often (versions ≈ µs), so
+    /// "latest" reads on idle shards are rarely behind the read version.
+    public var replicaFreshness: UInt64 = 1_000
     public var peekTimeout: UInt64 = 200_000
     public var popInterval: UInt64 = 100_000
     public var snapshotTimeout: UInt64 = 5_000_000

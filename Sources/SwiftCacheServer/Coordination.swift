@@ -37,8 +37,8 @@ public final class CoordinatorRole: Role {
 
     public func start() {
         if let bytes = context.disk.read(Self.diskKey) {
-            var r = WireReader(bytes)
-            if let rb = try? r.get(Ballot.self), let wb = try? r.get(Ballot.self), let v = try? r.optionalBlob() {
+            let state = try? WireReader.read(bytes) { r in (try r.get(Ballot.self), try r.get(Ballot.self), try r.optionalBlob()) }
+            if let (rb, wb, v) = state {
                 readBallot = rb; writeBallot = wb; value = v
             }
         }

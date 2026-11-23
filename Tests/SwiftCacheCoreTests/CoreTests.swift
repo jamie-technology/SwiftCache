@@ -25,6 +25,20 @@ import Testing
         #expect(Slots.slot(for: Bytes("{}x".utf8)) == Slots.slot(for: Bytes("{}x".utf8)))
     }
 
+    @Test func slotSetRangesRoundTrip() {
+        var rng = SystemRandomNumberGenerator()
+        for _ in 0..<50 {
+            var s = SlotSet()
+            for _ in 0..<Int.random(in: 0..<300, using: &rng) {
+                let start = Int.random(in: 0..<Slots.count, using: &rng)
+                for i in start..<min(Slots.count, start + Int.random(in: 1..<200, using: &rng)) { s.insert(i) }
+            }
+            #expect(SlotSet(ranges: s.ranges) == s)
+        }
+        #expect(SlotSet(ranges: SlotSet.all.ranges) == .all)
+        #expect(SlotSet.all.ranges.count == 1)
+    }
+
     @Test func slotSetRanges() {
         var s = SlotSet([1, 2, 3, 10, 16383])
         #expect(s.count == 5)
@@ -70,7 +84,16 @@ import Testing
             .resolve(rid: 17, ResolveRequest(generation: 2, proxyIndex: 0, version: 10, prevVersion: 9, lastSeenVersion: 8,
                                              txns: [ResolveTxn(readVersion: 5, readKeys: [[1]], readRanges: [], writeKeys: [[2]])],
                                              metaOps: [.transfer(moveID: 1, slots: SlotSet([3]), from: 0, to: 1)])),
-            .resolveReply(rid: 18, ResolveReply(verdicts: [0, 1, 2], stateOps: [StateOps(version: 9, ops: [.removeShard(shard: 4)])])),
+            .resolveReply(rid: 18, ResolveReply(version: 10, prevVersion: 9, verdicts: [0, 1, 2], stateOps: [StateOps(version: 9, ops: [.removeShard(shard: 4)])])),
+            .versionAndResolve(rid: 25, requestNum: 3, ResolveRequest(generation: 2, proxyIndex: 1, version: 0, prevVersion: 0, lastSeenVersion: 8,
+                                                                      txns: [], metaOps: [], replyTo: "p:1#proxy-1")),
+            .readBatch(rid: 26, items: [ReadItem(key: [1], version: 5), ReadItem(key: [2, 3], version: 6)]),
+            .readBatchReply(rid: 27, results: [.value([9], Versionstamp(version: 5, order: 1)), .value(nil, .zero), .error(.wrongShard)]),
+            .commitBatch(rid: 28, [CommitRequest(readVersion: 3, mutations: [.add(key: [1], delta: 2)])]),
+            .commitBatchReply(rid: 29, [.committed(Versionstamp(version: 7, order: 0)), .failed(.notCommitted)]),
+            .tlogDurable(generation: 2, version: 10), .committedVersion(generation: 2, version: 10),
+            .tlogCommitted(generation: 2, version: 10), .tlogLease(rid: 30, generation: 2),
+            .tlogPeek(rid: 31, tag: 4, from: 5, upTo: 0, need: 9),
             .tlogPush(rid: 19, TLogPush(generation: 2, prevVersion: 9, entry: entry, knownCommitted: 8)),
             .tlogPeekReply(rid: 20, PeekReply(status: .ok, entries: [PeekEntry(version: 10, mutations: [(0, .clear(key: [1]))], meta: [])], end: 10)),
             .tlogLockReply(rid: 21, LockReply(known: true, generation: 2, durableVersion: 10, knownCommitted: 9)),

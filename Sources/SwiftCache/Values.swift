@@ -83,8 +83,10 @@ public struct DatabaseOptions: Sendable {
     public var requestTimeout: UInt64 = 2_000_000
     /// Maximum attempts of a transaction retry loop.
     public var maxRetries = 100
-    /// Initial retry backoff (µs); doubles per attempt with jitter.
-    public var initialBackoff: UInt64 = 5_000
+    /// Initial retry backoff (µs); doubles per attempt with jitter. The first retry after a
+    /// conflict is immediate (the conflicting writer has already committed, so a fresh read
+    /// version usually succeeds); backoff only spaces out repeated conflicts on hot keys.
+    public var initialBackoff: UInt64 = 500
     /// Maximum retry backoff (µs).
     public var maxBackoff: UInt64 = 500_000
     /// Seconds an idempotent operation's commit record is kept (bounds how long after an

@@ -16,6 +16,9 @@ public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
     let clientEndpoint: Endpoint
     private let startTime = NIODeadline.now()
     private let nextRid = Atomic<UInt64>(1)
+    /// Lock-free splitmix64 state for cheap, non-cryptographic randomness (replica choice,
+    /// jitter). `SystemRandomNumberGenerator` is far too slow for per-request use.
+    private let randomState = Atomic<UInt64>(DispatchTime.now().uptimeNanoseconds | 1)
     private let connectionsLock = NIOLock()
     private var connections: [Endpoint: Connection] = [:]
     private var sweeper: RepeatedTask?
@@ -159,6 +162,10 @@ public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
     }
 
     public func random(_ upperBound: UInt64) -> UInt64 {
-        upperBound == 0 ? 0 : UInt64.random(in: 0..<upperBound)
+        guard upperBound > 1 else { return 0 }
+        var z = randomState.wrappingAdd(0x9E37_79B9_7F4A_7C15, ordering: .relaxed).newValue
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return (z ^ (z >> 31)) % upperBound
     }
 }

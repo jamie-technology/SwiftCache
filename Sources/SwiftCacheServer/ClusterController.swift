@@ -215,7 +215,7 @@ public final class ClusterController: Role {
         case .getClientInfo(let rid):
             guard phase == .running else { return context.send(.errorReply(rid: rid, .unavailable), to: from) }
             let topo = map.topology(epoch: (info.generation << 32) | (map.version & 0xFFFF_FFFF))
-            context.send(.clientInfoReply(rid: rid, ClientInfo(generation: info.generation, proxies: info.proxies, topology: topo)), to: from)
+            context.send(.clientInfoReply(rid: rid, ClientInfo(generation: info.generation, proxies: info.proxies, topology: topo, master: info.master)), to: from)
 
         case .getStatus(let rid):
             context.send(.statusReply(rid: rid, status), to: from)

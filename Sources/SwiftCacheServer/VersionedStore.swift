@@ -49,7 +49,9 @@ final class VersionedStore {
 
     private func append(_ key: Bytes, _ v: VersionedValue) {
         if data[key] == nil {
-            index.insert(key)
+            // System keys (idempotency records) are never range-read: keep them out of
+            // the sorted index.
+            if !SystemKeys.isSystem(key) { index.insert(key) }
             approximateBytes += key.count + 48
             data[key] = [v]
         } else {
@@ -169,7 +171,7 @@ final class VersionedStore {
         } else {
             guard !item.versions.isEmpty else { return }
             data[item.key] = item.versions
-            index.insert(item.key)
+            if !SystemKeys.isSystem(item.key) { index.insert(item.key) }
             approximateBytes += item.key.count + 48
             versionCount += item.versions.count
             for v in item.versions { approximateBytes += Self.size(of: v) }

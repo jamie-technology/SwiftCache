@@ -68,13 +68,11 @@ public final class CommitProxy: Role {
         var resolution: ResolveReply?
         var finalized = false
         var acks: Set<Endpoint> = []
-        var durable = false
         var replies: [(pending: Pending, result: CommitResult)] = []
         var hasData = false
         init(num: UInt64, txns: [Pending], meta: [Pending]) { self.num = num; self.txns = txns; self.meta = meta }
     }
     private var batches: [BatchState] = []
-    private var reporting = false
     private var lastBatchAt: UInt64 = 0
     private var committedAdvanced = false
     private var snapshotWritten = false
@@ -93,9 +91,18 @@ public final class CommitProxy: Role {
         self.knownCommitted = spec.startVersion
     }
 
+    private var statBatches = 0
+    private var statTxns = 0
+
     public func start() {
         context.ready()
         context.every(config.batchInterval) { [weak self] in self?.tick() }
+        context.every(5_000_000) { [weak self] in
+            guard let self, self.statBatches > 0 else { return }
+            self.context.log(.debug, "stats: \(self.statBatches) batches, \(self.statTxns) txns (\(self.statTxns / max(1, self.statBatches)) per batch)")
+            self.statBatches = 0
+            self.statTxns = 0
+        }
     }
 
     private func generationEnded(_ why: String) {
@@ -106,11 +113,23 @@ public final class CommitProxy: Role {
         context.stopSelf()
     }
 
+    /// A batch whose version/resolution hasn't come back yet.
+    private var resolving: Bool { batches.contains { !$0.finalized } }
+
+    /// Continuous pipelining: start the next batch as soon as nothing is awaiting
+    /// resolution, taking everything that arrived meanwhile (batch size adapts to load,
+    /// and no commit waits for a timer).
+    private func pump() {
+        guard !dead, !resolving, batches.count < config.maxInflightBatches,
+              !pending.isEmpty || !metaPending.isEmpty else { return }
+        startBatch()
+    }
+
     private func tick() {
         guard !dead else { return }
         let idle = context.now &- lastBatchAt >= config.idleBatchInterval
         let needSnapshot = spec.writeSnapshot && !snapshotWritten
-        if batches.count < config.maxInflightBatches
+        if batches.count < config.maxInflightBatches && !resolving
             && (!pending.isEmpty || !metaPending.isEmpty || idle || committedAdvanced || needSnapshot) {
             startBatch()
         }
@@ -135,8 +154,12 @@ public final class CommitProxy: Role {
             for (i, req) in reqs.enumerated() {
                 enqueue(Pending(client: from, rid: rid, request: req, group: group, index: i), startIfIdle: false)
             }
-            if batches.isEmpty && !pending.isEmpty { startBatch() }
+            pump()
             if reqs.isEmpty { context.send(.commitBatchReply(rid: rid, []), to: from) }
+        case .committedVersion(let gen, let version):
+            guard gen == spec.generation, from == spec.master else { return }
+            if version > knownCommitted { knownCommitted = version }
+            completeCommitted()
         case .getShardMap(let rid, let minVersion):
             if map.version >= minVersion || lastResolvedVersion >= minVersion {
                 context.send(.shardMapReply(rid: rid, map), to: from)
@@ -155,7 +178,7 @@ public final class CommitProxy: Role {
         }
         if p.request.metaOps.isEmpty { pending.append(p) } else { metaPending.append(p) }
         // Lightly loaded: don't wait for the batching tick.
-        if startIfIdle && batches.isEmpty { startBatch() }
+        if startIfIdle { pump() }
     }
 
     private func validate(_ req: CommitRequest, from: Endpoint) -> ErrorCode? {
@@ -182,37 +205,21 @@ public final class CommitProxy: Role {
         pending.removeFirst(take)
         metaPending = []
         requestNum += 1
+        statBatches += 1
+        statTxns += b.txns.count
         batches.append(b)
         lastBatchAt = context.now
         committedAdvanced = false
-        requestVersion(b)
-    }
-
-    private func requestVersion(_ b: BatchState) {
-        context.request(to: spec.master, timeout: config.requestTimeout, {
-            .getCommitVersion(rid: $0, proxyIndex: self.spec.index, requestNum: b.num)
-        }) { [weak self] reply in
-            guard let self, !self.dead else { return }
-            switch reply {
-            case .commitVersionReply(_, let prev, let version)?:
-                b.prevVersion = prev
-                b.version = version
-                self.resolve(b)
-            case .errorReply(_, .staleGeneration)?:
-                self.generationEnded("master gone")
-            case .errorReply?:
-                self.context.schedule(after: 10_000) { self.requestVersion(b) }
-            default:
-                self.requestVersion(b)  // same requestNum: the master returns the same version
-            }
-        }
+        versionAndResolve(b)
     }
 
     private func idempotencyKey(_ req: CommitRequest) -> Bytes? {
         req.idempotencyID.map { SystemKeys.idempotency($0) }
     }
 
-    private func resolve(_ b: BatchState) {
+    /// One round trip: the master allocates the batch's version and forwards the conflict
+    /// ranges to the resolver, which replies here with the version and the verdicts.
+    private func versionAndResolve(_ b: BatchState) {
         let txns = b.txns.map { p -> ResolveTxn in
             var readKeys = p.request.readConflictKeys
             var writeKeys = p.request.writeConflictKeys
@@ -225,24 +232,29 @@ public final class CommitProxy: Role {
             return ResolveTxn(readVersion: p.request.readVersion, readKeys: readKeys,
                               readRanges: p.request.readConflictRanges, writeKeys: writeKeys)
         }
-        let req = ResolveRequest(generation: spec.generation, proxyIndex: spec.index, version: b.version,
-                                 prevVersion: b.prevVersion, lastSeenVersion: map.version,
-                                 txns: txns, metaOps: b.meta.flatMap(\.request.metaOps))
-        sendResolve(b, req)
+        let req = ResolveRequest(generation: spec.generation, proxyIndex: spec.index, version: 0, prevVersion: 0,
+                                 lastSeenVersion: map.version, txns: txns, metaOps: b.meta.flatMap(\.request.metaOps))
+        sendVersionAndResolve(b, req)
     }
 
-    private func sendResolve(_ b: BatchState, _ req: ResolveRequest) {
-        guard let resolver = spec.resolvers.first else { return }
-        context.request(to: resolver, timeout: config.requestTimeout * 2, { .resolve(rid: $0, req) }) { [weak self] reply in
+    private func sendVersionAndResolve(_ b: BatchState, _ req: ResolveRequest) {
+        context.request(to: spec.master, timeout: config.requestTimeout * 2, {
+            .versionAndResolve(rid: $0, requestNum: b.num, req)
+        }) { [weak self] reply in
             guard let self, !self.dead else { return }
             switch reply {
             case .resolveReply(_, let r)?:
+                b.version = r.version
+                b.prevVersion = r.prevVersion
                 b.resolution = r
                 self.finalizeReady()
+            case .errorReply(_, .staleGeneration)?:
+                self.generationEnded("master or resolver gone")
             case .errorReply?:
-                self.generationEnded("resolver refused")
+                self.context.schedule(after: 10_000) { self.sendVersionAndResolve(b, req) }
             default:
-                self.sendResolve(b, req)
+                // Same request number: the master returns the same version.
+                self.sendVersionAndResolve(b, req)
             }
         }
     }
@@ -314,6 +326,7 @@ public final class CommitProxy: Role {
         b.hasData = !messages.isEmpty || !meta.isEmpty
         wakeMapWaiters()
 
+        defer { pump() }
         let push = TLogPush(generation: spec.generation, prevVersion: b.prevVersion,
                             entry: LogEntry(version: b.version, messages: messages, meta: meta),
                             knownCommitted: knownCommitted)
@@ -325,11 +338,7 @@ public final class CommitProxy: Role {
             guard let self, !self.dead else { return }
             switch reply {
             case .tlogPushReply(_, true)?:
-                b.acks.insert(tlog)
-                if b.acks.count == self.spec.tlogs.count {
-                    b.durable = true
-                    self.completeDurable()
-                }
+                b.acks.insert(tlog)  // completion comes from the master's committed version
             case .tlogPushReply(_, false)?, .errorReply?:
                 // The log is locked (a newer generation is recovering) or gone. Whether this
                 // batch survives is decided by that recovery; clients see an unknown result.
@@ -341,44 +350,19 @@ public final class CommitProxy: Role {
     }
 
     /// Reports the leading durable batches to the master, then replies to their clients.
-    private func completeDurable() {
-        guard !reporting else { return }
-        var ready: [BatchState] = []
+    /// Replies to the leading batches the master has declared committed (on every log, and
+    /// known to the master, so any read version handed out from now on includes them).
+    private func completeCommitted() {
+        var done = 0
         for b in batches {
-            guard b.durable else { break }
-            ready.append(b)
+            guard b.finalized, b.version <= knownCommitted else { break }
+            for r in b.replies { reply(r.pending, r.result) }
+            if b.hasData { committedAdvanced = true }
+            done += 1
         }
-        guard let last = ready.last else { return }
-        reporting = true
-        reportCommitted(last.version) { [weak self] in
-            guard let self, !self.dead else { return }
-            self.reporting = false
-            self.advanceKnownCommitted(last.version)
-            for b in ready {
-                for r in b.replies { self.reply(r.pending, r.result) }
-                if b.hasData { self.committedAdvanced = true }
-            }
-            self.batches.removeFirst(ready.count)
-            self.completeDurable()
-        }
-    }
-
-    /// Everything up to `version` is on every log: tell the logs right away so storage
-    /// servers can serve it without waiting for the next push.
-    private func advanceKnownCommitted(_ version: Version) {
-        guard version > knownCommitted else { return }
-        knownCommitted = version
-        for t in spec.tlogs { context.send(.tlogCommitted(generation: spec.generation, version: version), to: t) }
-    }
-
-    private func reportCommitted(_ version: Version, then: @escaping () -> Void) {
-        context.request(to: spec.master, timeout: config.requestTimeout, { .reportCommitted(rid: $0, version: version) }) { [weak self] reply in
-            guard let self, !self.dead else { return }
-            switch reply {
-            case .ack?: then()
-            case .errorReply?: self.generationEnded("master gone")
-            default: self.reportCommitted(version, then: then)
-            }
+        if done > 0 {
+            batches.removeFirst(done)
+            pump()
         }
     }
 
@@ -412,7 +396,6 @@ public final class CommitProxy: Role {
             finished = true
             grvRounds -= 1
             let v = max(mv, knownCommitted)
-            advanceKnownCommitted(v)
             for w in waiting { context.send(.readVersionReply(rid: w.rid, version: v), to: w.client) }
             // Requests that arrived during this round get the next one right away.
             if !grvQueue.isEmpty && grvRounds < maxGRVRounds { startGRV() }
