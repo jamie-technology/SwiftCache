@@ -208,17 +208,25 @@ How it works:
 
 - The logical operation gets a 16-byte **operation id**, stable across retries. Each attempt
   also gets an **attempt id**.
-- The commit proxy writes `\xff/idmp/<operation id>` = (versionstamp, attempt id)
-  **atomically with the commit**. Every attempt both reads (for conflict purposes) and writes
-  that key, so two attempts can never both commit: whichever commits second conflicts.
-- After an unknown result, the next attempt first reads the record. If an earlier attempt
-  committed, it returns **that attempt's** result and versionstamp (`uuid-A` in the example,
-  not a fresh `uuid-B`) without running the body again.
+- Every attempt both reads and writes the **conflict key** `\xff/idmp/<operation id>` in the
+  resolver, so two attempts can never both commit: whichever is resolved second conflicts.
+  The conflict key exists only in the resolver; it is never stored.
+- The commit proxy writes **one record per commit batch**, `\xff/idmpb/<commit version>`,
+  listing every idempotent operation in that batch (operation id, attempt id, order),
+  **atomically with the commits**.
+- After an unknown result, the next attempt first range-reads the batch records with
+  versions above the read version of the unknown attempt, up to its own read version. If an
+  earlier attempt committed, its record is in that range: the call returns **that
+  attempt's** result and versionstamp (`uuid-A` in the example, not a fresh `uuid-B`)
+  without running the body again. If it is still in flight, the conflict key makes one of
+  the two fail.
 - Records expire after `DatabaseOptions.idempotencyRetention` (10 minutes by default),
   which bounds how long after an unknown result a retry can still be deduplicated.
 
-Cost: one small extra write per idempotent commit, plus one point read on a retry after an
-unknown result. The single-key conveniences (`set`, `clear`, `add`, `compareAndSwap`,
+Cost: a few bytes per idempotent commit inside one record per batch, plus a range read on
+a retry after an unknown result. (Until November 2026 each operation had its own stored
+record, which at sustained write rates held tens of millions of keys for the retention
+period.) The single-key conveniences (`set`, `clear`, `add`, `compareAndSwap`,
 `compareAndDelete`) are always idempotent. `transaction` is opt-in, as in FoundationDB
 (whose 7.1+ `automatic_idempotency` option works the same way).
 

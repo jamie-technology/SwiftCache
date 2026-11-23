@@ -158,6 +158,8 @@ public func runSimulation(seed: UInt64, options: SimulationOptions = SimulationO
     }
 
     checkReplicaConsistency(sim)
+    checkLogRetention(sim)
+    checkCoordinatorsAgree(sim)
     if options.clients >= 6 {
         for k in ["bank.commits", "cycle.commits", "cas.success", "add.commits", "orders.commits", "history.commits"] where counters[k] == 0 {
             sim.fail("no progress: \(k) == 0")

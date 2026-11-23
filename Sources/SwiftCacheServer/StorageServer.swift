@@ -28,6 +28,8 @@ public final class StorageServer: Role {
     private var peekSeq: UInt64 = 0
     /// The version the current peek asks the log to wait for (0 = data only).
     private var peekNeed: Version = 0
+    /// The log the in-flight peek went to.
+    private var peekTarget: Endpoint?
     private var peekCursor = 0
     private var lastPopped: Version = 0
     private var tagRetired = Set<Tag>()
@@ -84,7 +86,8 @@ public final class StorageServer: Role {
     /// Every visible key/value in owned slots at `version` (for consistency checks).
     public func debugContents(at version: Version) -> [Bytes: Bytes] {
         var out: [Bytes: Bytes] = [:]
-        for (key, versions) in store.data where owned.contains(Slots.slot(for: key)) {
+        for (k, versions) in store.data where owned.contains(Slots.slot(for: k.bytes)) {
+            let key = k.bytes
             var v: VersionedValue?
             for x in versions where x.stamp.version <= version { v = x }
             if let value = v?.visibleValue(at: version) { out[key] = value }
@@ -94,7 +97,7 @@ public final class StorageServer: Role {
 
     /// The stored versions of one key (debugging).
     public func debugVersions(_ key: Bytes) -> [Versionstamp] {
-        store.data[key]?.map(\.stamp) ?? []
+        store.data[ByteKey(key)]?.map(\.stamp) ?? []
     }
 
     var report: StorageReport {
@@ -155,6 +158,14 @@ public final class StorageServer: Role {
     /// as soon as it's committed (superseding a data-only peek).
     private func needVersion(_ version: Version) {
         guard version > applied, version > peekNeed || !peekInFlight else { return }
+        if peekInFlight, let target = peekTarget {
+            // Tell the log holding our peek, rather than superseding it (one message
+            // instead of a cancelled reply plus a new round trip). If the peek was already
+            // answered, the next one is built from `neededVersion`.
+            peekNeed = version
+            context.send(.tlogNeed(tag: tag, need: version), to: target)
+            return
+        }
         peekInFlight = false
         pullIfNeeded()
     }
@@ -165,6 +176,7 @@ public final class StorageServer: Role {
         peekSeq += 1
         let seq = peekSeq
         let tlog = dbInfo.tlogs[peekCursor % dbInfo.tlogs.count]
+        peekTarget = tlog
         let myTag = tag
         let after = applied
         let need = neededVersion > applied ? neededVersion : 0
@@ -522,8 +534,9 @@ public final class StorageServer: Role {
         case .ok: break
         }
         let owned = self.owned
+        let system = SystemKeys.isSystem(range.begin)
         let result = store.range(range, at: version, limit: max(1, limit)) {
-            owned.contains(Slots.slot(for: $0)) && !SystemKeys.isSystem($0)
+            owned.contains(Slots.slot(for: $0)) && SystemKeys.isSystem($0) == system
         }
         context.send(.rangeReply(rid: rid, entries: result.entries, more: result.more, servedSlots: owned), to: from)
     }

@@ -117,6 +117,8 @@ public final class RoleContext {
     static let timeoutResolution: UInt64 = 10_000
     /// Called once when the role is ready to serve (used by recruitment).
     var onReady: (() -> Void)?
+    /// Run by the host before each of this role's timers fires (process-wide checks).
+    var beforeEvent: (() -> Void)?
     /// Called when the role asks to stop itself.
     var onStop: (() -> Void)?
 
@@ -138,6 +140,8 @@ public final class RoleContext {
     public func schedule(after micros: UInt64, _ action: @escaping () -> Void) {
         env.schedule(after: micros) { [weak self] in
             guard let self, !self.stopped else { return }
+            self.beforeEvent?()
+            guard !self.stopped else { return }
             action()
         }
     }
@@ -226,6 +230,11 @@ public final class ProcessHost: ProcessNode {
     public let env: any ProcessEnvironment
     public private(set) var roles: [Endpoint: any Role] = [:]
     private var startActions: [() -> Void] = []
+    private var eventChecks: [() -> Void] = []
+
+    /// Registers a check run before every message or timer this process handles.
+    public func beforeEvent(_ check: @escaping () -> Void) { eventChecks.append(check) }
+    private func runEventChecks() { for c in eventChecks { c() } }
     public let processClass: ProcessClass
 
     public init(env: any ProcessEnvironment, processClass: ProcessClass) {
@@ -251,6 +260,7 @@ public final class ProcessHost: ProcessNode {
         let ep = role.context.endpoint
         roles[ep] = role
         role.context.onStop = { [weak self] in self?.roles[ep] = nil }
+        role.context.beforeEvent = { [weak self] in self?.runEventChecks() }
         role.start()
     }
 
@@ -270,6 +280,7 @@ public final class ProcessHost: ProcessNode {
     }
 
     public func receive(_ message: Message, from: Endpoint, to: Endpoint) {
+        runEventChecks()
         guard let role = roles[to] else {
             // A definitive "this role doesn't exist (any more)": role endpoints are unique
             // per incarnation, so the sender can treat it as permanent.

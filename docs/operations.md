@@ -94,7 +94,7 @@ sc bench --seconds 10 --concurrency 32 --read-ratio 0.8
 | `--coordinator`, `--data-dir` | — | This process is a coordinator; its durable state lives in `--data-dir` |
 | `--replication` | 2 | Storage replicas per shard |
 | `--logs` | 3 | Transaction logs per generation |
-| `--proxies` | 2 | Commit proxies per generation |
+| `--proxies` | 2 | Commit proxies per generation (the k8s config sets 1: one proxy on the master's process is fastest on small clusters) |
 | `--mvcc-window` | 10 s | How far back historical reads and long transactions work |
 | `--failure-timeout` | 3 s | Missed registrations before a process counts as dead |
 | `--shard-loss-timeout` | 120 s | Silence tolerated from a shard's *last* replica before its data is given up |

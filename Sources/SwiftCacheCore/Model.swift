@@ -151,18 +151,56 @@ public struct KeyValueEntry: Hashable, Sendable, WireCodable {
 /// Keys starting with 0xFF are reserved for the system.
 public enum SystemKeys {
     public static let prefix: UInt8 = 0xFF
-    /// `\xff/idmp/<operation id>` → versionstamp of the commit that carried that operation.
+    /// `\xff/idmp/<operation id>`: the operation's conflict key (resolver only, never stored).
     public static func idempotency(_ id: Bytes) -> Bytes { [0xFF] + Bytes("/idmp/".utf8) + id }
     public static func isSystem(_ key: Bytes) -> Bool { key.first == prefix }
 
-    /// The value of an idempotency record: the commit's versionstamp and attempt id.
-    public static func idempotencyValue(stamp: Versionstamp, attemptID: UInt64) -> Bytes {
-        stamp.bytes + LittleEndianInt64.encode(Int64(bitPattern: attemptID))
+    /// `\xff/idmpb/` + big-endian commit version: the idempotency record of one commit
+    /// batch, listing every idempotent operation it committed. One storage write per batch
+    /// instead of one per operation. (Two attempts of an operation are kept from both
+    /// committing by the per-operation conflict key `idempotency(id)`, which the resolver
+    /// tracks; it is never written to storage.)
+    public static let idempotencyBatchPrefix: Bytes = [0xFF] + Bytes("/idmpb/".utf8)
+
+    public static func idempotencyBatch(_ version: Version) -> Bytes {
+        idempotencyBatchPrefix + (0..<8).map { UInt8(truncatingIfNeeded: version >> (56 - 8 * UInt64($0))) }
     }
 
-    public static func parseIdempotencyValue(_ value: Bytes) -> (stamp: Versionstamp, attemptID: UInt64)? {
-        guard value.count == 18, let stamp = Versionstamp(bytes: Array(value[0..<10])) else { return nil }
-        return (stamp, UInt64(bitPattern: LittleEndianInt64.decode(Array(value[10...]))))
+    public static func isIdempotencyBatch(_ key: Bytes) -> Bool {
+        key.count == idempotencyBatchPrefix.count + 8 && key.starts(with: idempotencyBatchPrefix)
+    }
+
+    public static func idempotencyBatchVersion(_ key: Bytes) -> Version? {
+        guard isIdempotencyBatch(key) else { return nil }
+        return key.suffix(8).reduce(0) { $0 << 8 | Version($1) }
+    }
+
+    public struct IdempotencyEntry: Hashable, Sendable {
+        public var id: Bytes
+        public var attemptID: UInt64
+        /// The operation's order within its commit (its versionstamp is (version, order)).
+        public var order: UInt16
+        public init(id: Bytes, attemptID: UInt64, order: UInt16) { self.id = id; self.attemptID = attemptID; self.order = order }
+    }
+
+    public static func idempotencyBatchValue(_ entries: [IdempotencyEntry]) -> Bytes {
+        var w = WireWriter()
+        w.u32(UInt32(entries.count))
+        for e in entries { w.blob(e.id); w.u64(e.attemptID); w.u16(e.order) }
+        return w.bytes
+    }
+
+    public static func parseIdempotencyBatchValue(_ value: Bytes) -> [IdempotencyEntry]? {
+        value.withUnsafeBytes { raw in
+            var r = WireReader(raw)
+            guard let n = try? r.u32() else { return nil }
+            var out: [IdempotencyEntry] = []
+            for _ in 0..<n {
+                guard let id = try? r.blob(), let a = try? r.u64(), let o = try? r.u16() else { return nil }
+                out.append(IdempotencyEntry(id: id, attemptID: a, order: o))
+            }
+            return r.isAtEnd ? out : nil
+        }
     }
 }
 
@@ -172,9 +210,10 @@ public struct CommitRequest: Hashable, Sendable, WireCodable {
     public var readConflictRanges: [KeyRange]
     public var writeConflictKeys: [Bytes]
     public var mutations: [Mutation]
-    /// Logical operation id (16 bytes), stable across retries. When set, the proxy records
-    /// `SystemKeys.idempotency(id)` = this commit's versionstamp atomically with the
-    /// commit, and the client adds a read conflict on that key to every attempt.
+    /// Logical operation id (16 bytes), stable across retries. When set, every attempt reads
+    /// and writes the conflict key `SystemKeys.idempotency(id)` (so two attempts can't both
+    /// commit), and the proxy lists the operation in its batch's `idempotencyBatch` record,
+    /// atomically with the commit.
     public var idempotencyID: Bytes?
     /// Seconds to retain the idempotency record.
     public var idempotencyRetention: UInt32

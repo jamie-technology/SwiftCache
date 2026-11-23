@@ -81,15 +81,17 @@ Same k3s cluster (colima, 4 vCPU laptop VM), in-cluster clients, 100-byte values
 no pipelining. Redis is a single unreplicated process. SwiftCache is 3 shards × 2 replicas,
 3 transaction logs, and every operation is strictly serializable.
 
-| 256 clients | Redis 7 | SwiftCache |
-| --- | --- | --- |
-| GET / `get` | 141k ops/s | **197k ops/s** |
-| SET / `set` (replicated, idempotent) | 144k ops/s | 67k ops/s |
-| 2-key read-modify-write transaction | — | 26k ops/s |
+| | Redis 7, 32 clients | SwiftCache, 32 | Redis 7, 256 clients | SwiftCache, 256 |
+| --- | --- | --- | --- | --- |
+| GET / `get` | 184k ops/s | 115k ops/s | 160k ops/s | **322k ops/s** |
+| SET / `set` (replicated, idempotent) | 166k ops/s | 40k ops/s | 153k ops/s | 112k ops/s |
+| 2-key read-modify-write transaction | — | 17k ops/s | — | 49k ops/s (p99.9 36 ms) |
 
-On the same laptop without Docker networking: **427k gets/s** at 512 clients (p99 2.3 ms),
-159k sets/s, ~97k two-key transactions/s; single-client get p50 0.05 ms. With few clients
-Redis's single round trip still wins in k3s (at 32 clients: 175k vs 85k gets/s). See [docs/performance.md](docs/performance.md) for
+SwiftCache beats Redis on reads at high concurrency (2× at 256 clients); Redis's single
+unreplicated process still wins on writes, and on everything at low concurrency (one
+client: Redis 38k gets/s and 86k sets/s, SwiftCache 13k and 4k, p50 0.07 ms and 0.22 ms).
+On the same laptop without Docker networking: 440k gets/s at 512 clients, 152k sets/s and
+71k two-key transactions/s at 128. See [docs/performance.md](docs/performance.md) for
 methodology, the optimizations made, and what's next.
 
 ## Quick start (k3s)

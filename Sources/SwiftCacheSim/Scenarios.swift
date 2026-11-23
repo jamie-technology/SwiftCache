@@ -1,3 +1,4 @@
+import Synchronization
 import SwiftCache
 import SwiftCacheCore
 import SwiftCacheServer
@@ -18,6 +19,10 @@ public enum Scenario: String, CaseIterable, Sendable {
     case proxyDiesAfterLogging
     /// Log processes die mid-replication: no acknowledged commit is lost.
     case logDiesDuringReplication
+    /// Pushes to one log are lost for a while (shorter than failure detection): proxies
+    /// re-push uncommitted batches, the generation resumes without a recovery, and no
+    /// acknowledged commit is lost.
+    case lostPushes
     /// A storage replica is cut off briefly, repeatedly: it catches up from the logs (it
     /// isn't replaced) and ends identical to its peers.
     case storageFallsBehind
@@ -70,6 +75,18 @@ final class Monitor: @unchecked Sendable {
         }
         // Leases: never two processes that believe they are the controller.
         let leaders = sim.roles(CandidateRole.self).filter(\.isLeader)
+        // A leader's lease never outlives the coordinators': while it believes it leads, no
+        // majority could nominate anyone else. A coordinator is bound to it if it holds a
+        // live lease for it, is down, or restarted and still abstains.
+        for l in leaders {
+            let bound = sim.coordinatorAddresses.filter { addr in
+                guard sim.isAlive(addr), let c = sim.host(addr)?.role(CoordinatorRole.self) else { return true }
+                return c.abstaining || c.liveNominee == l.identity
+            }.count
+            if bound < majority(sim.coordinatorAddresses.count) {
+                sim.fail("\(l.context.endpoint) believes it leads, but only \(bound) coordinators are bound to it")
+            }
+        }
         if leaders.count > 1 {
             sim.fail("two controllers at once: \(leaders.map(\.context.endpoint))")
         }
@@ -99,6 +116,29 @@ func checkReplicaConsistency(_ sim: Simulator) {
                 let diff = Set(first.keys).symmetricDifference(other.keys).count
                 sim.fail("shard \(shard.id): replicas \(replicas[0].context.endpoint) and \(r.context.endpoint) differ at version \(v) (\(first.count) vs \(other.count) keys, \(diff) differing keys)")
             }
+        }
+    }
+}
+
+/// After quiescing, the running generation's logs must have released what storage
+/// popped (idle batches alone add ~200 versions/s, so a leak shows up as thousands).
+func checkLogRetention(_ sim: Simulator) {
+    for log in sim.roles(TLogRole.self) where !log.locked && !log.context.stopped {
+        let (entries, metaOnly) = log.retainedVersions
+        if entries > 1_000 || metaOnly > 1_000 {
+            sim.fail("log \(log.context.endpoint) of generation \(log.generation) retains \(entries) versions (+\(metaOnly) metadata-only); data floor \(log.dataFloor.map(String.init) ?? "none"), durable \(log.durable)")
+        }
+    }
+}
+
+/// After quiescing, every coordinator points clients at the actual controller (one outside
+/// the electing majority must not keep naming a candidate that never became controller).
+func checkCoordinatorsAgree(_ sim: Simulator) {
+    guard let leader = sim.roles(CandidateRole.self).first(where: \.isLeader) else { return }
+    for addr in sim.coordinatorAddresses where sim.isAlive(addr) {
+        guard let c = sim.host(addr)?.role(CoordinatorRole.self), !c.abstaining else { continue }
+        if c.liveNominee != leader.identity {
+            sim.fail("coordinator \(addr) names \(c.liveNominee?.endpoint ?? "nobody"), but the controller is \(leader.identity.endpoint)")
         }
     }
 }
@@ -246,6 +286,34 @@ func scheduleScenario(_ sim: Simulator, _ scenario: Scenario, monitor: Monitor, 
                       let log = pick(sim.logAddresses) else { return }
                 sim.killRole(m.context.endpoint)
                 sim.pause(log, for: 600_000)
+            }
+        }
+
+    case .lostPushes:
+        // Three rounds, each checked within ~11 s, so it fits short (14 s) test runs.
+        for round in 0..<3 {
+            at(1_500_000 + UInt64(round) * 3_000_000) {
+                guard let m = sim.roles(MasterRole.self).first(where: { $0.phase == .running }),
+                      let log = sim.roles(TLogRole.self).first(where: { $0.generation == m.generation && !$0.locked })?.context.endpoint
+                else { return }
+                let gen = m.generation
+                sim.trace("scenario: losing pushes to \(log) (generation \(gen))")
+                sim.dropFilter = { msg, _, to in
+                    if case .tlogPush = msg { return to == log }
+                    return false
+                }
+                sim.after(400_000) { sim.dropFilter = nil }
+                let commitsBefore = Mutex(0)
+                sim.after(2_000_000) { commitsBefore.withLock { $0 = counters["bank.commits"] + counters["add.commits"] } }
+                sim.after(2_900_000) {
+                    guard let now = sim.roles(MasterRole.self).first(where: { $0.phase == .running }) else {
+                        return sim.fail("no running master after lost pushes")
+                    }
+                    if now.generation != gen { sim.fail("lost pushes forced a recovery (generation \(gen) -> \(now.generation))") }
+                    if counters["bank.commits"] + counters["add.commits"] == commitsBefore.withLock({ $0 }) {
+                        sim.fail("no commits after lost pushes to \(log)")
+                    }
+                }
             }
         }
 

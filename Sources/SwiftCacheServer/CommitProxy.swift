@@ -67,14 +67,16 @@ public final class CommitProxy: Role {
         var prevVersion: Version = 0
         var resolution: ResolveReply?
         var finalized = false
-        var acks: Set<Endpoint> = []
+        /// Declared committed by the master (no more re-pushes).
+        var committed = false
+        var push: TLogPush?
+        var pushedAt: UInt64 = 0
         var replies: [(pending: Pending, result: CommitResult)] = []
         var hasData = false
         init(num: UInt64, txns: [Pending], meta: [Pending]) { self.num = num; self.txns = txns; self.meta = meta }
     }
     private var batches: [BatchState] = []
     private var lastBatchAt: UInt64 = 0
-    private var committedAdvanced = false
     private var snapshotWritten = false
 
     private var grvQueue: [(client: Endpoint, rid: UInt64)] = []
@@ -97,6 +99,7 @@ public final class CommitProxy: Role {
     public func start() {
         context.ready()
         context.every(config.batchInterval) { [weak self] in self?.tick() }
+        context.every(config.requestTimeout / 4) { [weak self] in self?.repushStale() }
         context.every(5_000_000) { [weak self] in
             guard let self, self.statBatches > 0 else { return }
             self.context.log(.debug, "stats: \(self.statBatches) batches, \(self.statTxns) txns (\(self.statTxns / max(1, self.statBatches)) per batch)")
@@ -129,8 +132,10 @@ public final class CommitProxy: Role {
         guard !dead else { return }
         let idle = context.now &- lastBatchAt >= config.idleBatchInterval
         let needSnapshot = spec.writeSnapshot && !snapshotWritten
+        // (Logs learn the committed version from the master's `tlogCommitted`, so no batch
+        // is needed just to carry it.)
         if batches.count < config.maxInflightBatches && !resolving
-            && (!pending.isEmpty || !metaPending.isEmpty || idle || committedAdvanced || needSnapshot) {
+            && (!pending.isEmpty || !metaPending.isEmpty || idle || needSnapshot) {
             startBatch()
         }
         if !grvQueue.isEmpty && grvRounds < maxGRVRounds { startGRV() }
@@ -160,6 +165,10 @@ public final class CommitProxy: Role {
             guard gen == spec.generation, from == spec.master else { return }
             if version > knownCommitted { knownCommitted = version }
             completeCommitted()
+        case .tlogPushReply(_, false) where spec.tlogs.contains(from), .errorReply where spec.tlogs.contains(from):
+            // A log is locked (a newer generation is recovering) or gone. Whether pending
+            // batches survive is decided by that recovery; clients see an unknown result.
+            generationEnded("log \(from) refused a push")
         case .getShardMap(let rid, let minVersion):
             if map.version >= minVersion || lastResolvedVersion >= minVersion {
                 context.send(.shardMapReply(rid: rid, map), to: from)
@@ -209,7 +218,6 @@ public final class CommitProxy: Role {
         statTxns += b.txns.count
         batches.append(b)
         lastBatchAt = context.now
-        committedAdvanced = false
         versionAndResolve(b)
     }
 
@@ -282,6 +290,8 @@ public final class CommitProxy: Role {
 
         var messages: [LogMessage] = []
         var order: UInt16 = 0
+        var idempotent: [SystemKeys.IdempotencyEntry] = []
+        var retention: UInt32 = 0
         for (i, p) in b.txns.enumerated() {
             let verdict = i < r.verdicts.count ? r.verdicts[i] : 1
             switch verdict {
@@ -293,12 +303,9 @@ public final class CommitProxy: Role {
                 }
                 let stamp = Versionstamp(version: b.version, order: order)
                 for (m, tags) in routed { messages.append(LogMessage(order: order, mutation: m, tags: tags)) }
-                if let key = idempotencyKey(p.request) {
-                    let ttl = UInt64(max(1, p.request.idempotencyRetention)) * 1_000_000
-                    let value = SystemKeys.idempotencyValue(stamp: stamp, attemptID: p.request.attemptID)
-                    let m = Mutation.set(key: key, value: value, ttl: ttl)
-                    let tags = map.tags(forSlot: Slots.slot(for: key))
-                    if !tags.isEmpty { messages.append(LogMessage(order: order, mutation: m, tags: tags)) }
+                if let id = p.request.idempotencyID {
+                    idempotent.append(SystemKeys.IdempotencyEntry(id: id, attemptID: p.request.attemptID, order: order))
+                    retention = max(retention, p.request.idempotencyRetention)
                 }
                 b.replies.append((p, .committed(stamp)))
                 order += 1
@@ -306,6 +313,26 @@ public final class CommitProxy: Role {
                 b.replies.append((p, .failed(.transactionTooOld)))
             default:
                 b.replies.append((p, .failed(.notCommitted)))
+            }
+        }
+        if !idempotent.isEmpty {
+            // One record for the whole batch, atomically with its commits. If its shard
+            // has no owner the batch can't record them: fail those operations instead.
+            let key = SystemKeys.idempotencyBatch(b.version)
+            let tags = map.tags(forSlot: Slots.slot(for: key))
+            if tags.isEmpty {
+                let ids = Set(idempotent.map(\.order))
+                messages.removeAll { ids.contains($0.order) }
+                for i in b.replies.indices {
+                    if case .committed(let stamp) = b.replies[i].result, ids.contains(stamp.order), b.replies[i].pending.request.idempotencyID != nil {
+                        b.replies[i].result = .failed(.unavailable)
+                    }
+                }
+            } else {
+                let m = Mutation.set(key: key, value: SystemKeys.idempotencyBatchValue(idempotent),
+                                     ttl: UInt64(max(1, retention)) * 1_000_000)
+                messages.append(LogMessage(order: order, mutation: m, tags: tags))
+                order += 1
             }
         }
         var meta: [TaggedMeta] = []
@@ -330,22 +357,25 @@ public final class CommitProxy: Role {
         let push = TLogPush(generation: spec.generation, prevVersion: b.prevVersion,
                             entry: LogEntry(version: b.version, messages: messages, meta: meta),
                             knownCommitted: knownCommitted)
-        for t in spec.tlogs { sendPush(b, push, to: t) }
+        sendPushes(b, push)
     }
 
-    private func sendPush(_ b: BatchState, _ push: TLogPush, to tlog: Endpoint) {
-        context.request(to: tlog, timeout: config.requestTimeout, { .tlogPush(rid: $0, push) }) { [weak self] reply in
-            guard let self, !self.dead else { return }
-            switch reply {
-            case .tlogPushReply(_, true)?:
-                b.acks.insert(tlog)  // completion comes from the master's committed version
-            case .tlogPushReply(_, false)?, .errorReply?:
-                // The log is locked (a newer generation is recovering) or gone. Whether this
-                // batch survives is decided by that recovery; clients see an unknown result.
-                self.generationEnded("log \(tlog) refused a push")
-            default:
-                self.sendPush(b, push, to: tlog)  // the log treats a repeat as a no-op
-            }
+    /// Pushes a version to every log. Logs acknowledge durability to the master (whose
+    /// committed version completes the batch), and reply to us only to refuse. So a push
+    /// is fire-and-forget, re-sent to every log until the master declares it committed:
+    /// a log treats a repeat of a version it has as a no-op.
+    private func sendPushes(_ b: BatchState, _ push: TLogPush) {
+        b.push = push
+        b.pushedAt = context.now
+        for t in spec.tlogs { context.send(.tlogPush(rid: 0, push), to: t) }
+    }
+
+    /// Re-pushes batches the master hasn't declared committed within a request timeout
+    /// (a push or durability report may have been lost on a broken connection).
+    private func repushStale() {
+        let now = context.now
+        for b in batches where b.finalized && !b.committed {
+            if let push = b.push, now &- b.pushedAt >= config.requestTimeout { sendPushes(b, push) }
         }
     }
 
@@ -357,7 +387,7 @@ public final class CommitProxy: Role {
         for b in batches {
             guard b.finalized, b.version <= knownCommitted else { break }
             for r in b.replies { reply(r.pending, r.result) }
-            if b.hasData { committedAdvanced = true }
+            b.committed = true
             done += 1
         }
         if done > 0 {

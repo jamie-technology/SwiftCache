@@ -6,8 +6,23 @@ import SwiftCacheCore
 /// see the newest version with `stamp.version <= v`. Old versions are garbage collected
 /// once they fall out of the MVCC window.
 final class VersionedStore {
-    private(set) var data: [Bytes: [VersionedValue]] = [:]
+    private(set) var data: [ByteKey: [VersionedValue]] = [:]
     private var index = SortedKeyIndex()
+    /// Batch idempotency records (`SystemKeys.idempotencyBatch`), range-read by clients
+    /// resolving an unknown commit result. Kept apart so user range reads never walk them.
+    private var systemIndex = SortedKeyIndex()
+
+    private func indexInsert(_ key: Bytes) {
+        if !SystemKeys.isSystem(key) {
+            index.insert(key)
+        } else if SystemKeys.isIdempotencyBatch(key) {
+            systemIndex.insert(key)
+        }
+    }
+
+    private func indexRemove(_ key: Bytes) {
+        if !SystemKeys.isSystem(key) { index.remove(key) } else { systemIndex.remove(key) }
+    }
     private(set) var versionCount = 0
     private(set) var approximateBytes = 0
 
@@ -37,25 +52,23 @@ final class VersionedStore {
             append(key, VersionedValue(stamp: stamp, value: value, expiresAt: ttl == 0 ? 0 : stamp.version &+ ttl))
         case .clear(let key):
             // Clearing a key that doesn't exist (or is already cleared) needn't store anything.
-            if let latest = data[key]?.last, latest.value != nil {
+            if let latest = data[ByteKey(key)]?.last, latest.value != nil {
                 append(key, VersionedValue(stamp: stamp, value: nil))
             }
         case .add(let key, let delta):
-            let current = data[key]?.last?.visibleValue(at: stamp.version)
+            let current = data[ByteKey(key)]?.last?.visibleValue(at: stamp.version)
             let sum = LittleEndianInt64.decode(current) &+ delta
             append(key, VersionedValue(stamp: stamp, value: LittleEndianInt64.encode(sum)))
         }
     }
 
     private func append(_ key: Bytes, _ v: VersionedValue) {
-        if data[key] == nil {
-            // System keys (idempotency records) are never range-read: keep them out of
-            // the sorted index.
-            if !SystemKeys.isSystem(key) { index.insert(key) }
+        if data[ByteKey(key)] == nil {
+            indexInsert(key)
             approximateBytes += key.count + 48
-            data[key] = [v]
+            data[ByteKey(key)] = [v]
         } else {
-            data[key]!.append(v)
+            data[ByteKey(key)]!.append(v)
         }
         versionCount += 1
         approximateBytes += Self.size(of: v)
@@ -67,7 +80,7 @@ final class VersionedStore {
 
     /// The newest version of `key` at or before `version`, if any.
     func get(_ key: Bytes, at version: Version) -> VersionedValue? {
-        guard let versions = data[key] else { return nil }
+        guard let versions = data[ByteKey(key)] else { return nil }
         // Fast path: most reads are of the latest version.
         if let last = versions.last, last.stamp.version <= version { return last }
         var lo = 0, hi = versions.count
@@ -83,7 +96,9 @@ final class VersionedStore {
     func range(_ range: KeyRange, at version: Version, limit: Int, include: (Bytes) -> Bool) -> (entries: [KeyValueEntry], more: Bool) {
         var out = [KeyValueEntry]()
         var more = false
-        index.forEach(from: range.begin, to: range.end) { key in
+        // User ranges come from `index`, system (idempotency batch) ranges from `systemIndex`.
+        let idx = SystemKeys.isSystem(range.begin) ? systemIndex : index
+        idx.forEach(from: range.begin, to: range.end) { key in
             guard include(key), let v = get(key, at: version), let value = v.visibleValue(at: version) else { return true }
             if out.count >= limit { more = true; return false }
             out.append(KeyValueEntry(key: key, value: value, stamp: v.stamp))
@@ -109,7 +124,7 @@ final class VersionedStore {
     }
 
     private func trim(_ key: Bytes, oldest: Version) {
-        guard var versions = data[key] else { return }
+        guard var versions = data[ByteKey(key)] else { return }
         // Index of newest version <= oldest.
         var keepFrom = -1
         for (i, v) in versions.enumerated() where v.stamp.version <= oldest { keepFrom = i }
@@ -122,26 +137,27 @@ final class VersionedStore {
         if versions.count == 1, versions[0].visibleValue(at: oldest) == nil {
             approximateBytes -= Self.size(of: versions[0]) + key.count + 48
             versionCount -= 1
-            data[key] = nil
-            index.remove(key)
+            data[ByteKey(key)] = nil
+            indexRemove(key)
         } else {
-            data[key] = versions
+            data[ByteKey(key)] = versions
         }
     }
 
     /// Removes every version newer than `version` (used by coordinator recovery).
     func truncate(after version: Version) {
         var emptied = [Bytes]()
-        for (key, versions) in data {
+        for (k, versions) in data {
+            let key = k.bytes
             guard let last = versions.last, last.stamp.version > version else { continue }
             let kept = versions.filter { $0.stamp.version <= version }
             for v in versions where v.stamp.version > version { approximateBytes -= Self.size(of: v) }
             versionCount -= versions.count - kept.count
-            if kept.isEmpty { emptied.append(key) } else { data[key] = kept }
+            if kept.isEmpty { emptied.append(key) } else { data[ByteKey(key)] = kept }
         }
         for key in emptied {
-            data[key] = nil
-            index.remove(key)
+            data[ByteKey(key)] = nil
+            indexRemove(key)
             approximateBytes -= key.count + 48
         }
     }
@@ -149,8 +165,8 @@ final class VersionedStore {
     /// Every version of every key in `slots`, sorted by key.
     func extract(slots: SlotSet) -> [SnapshotChunk.Item] {
         var items = [SnapshotChunk.Item]()
-        for (key, versions) in data where slots.contains(Slots.slot(for: key)) {
-            items.append(SnapshotChunk.Item(key: key, versions: versions))
+        for (k, versions) in data where slots.contains(Slots.slot(for: k.bytes)) {
+            items.append(SnapshotChunk.Item(key: k.bytes, versions: versions))
         }
         items.sort { bytesLess($0.key, $1.key) }
         return items
@@ -158,7 +174,7 @@ final class VersionedStore {
 
     /// Installs copied versions (merging with anything already present, deduplicated by stamp).
     func install(_ item: SnapshotChunk.Item) {
-        if let existing = data[item.key] {
+        if let existing = data[ByteKey(item.key)] {
             var merged = existing
             let seen = Set(existing.map(\.stamp))
             for v in item.versions where !seen.contains(v.stamp) {
@@ -167,11 +183,11 @@ final class VersionedStore {
                 approximateBytes += Self.size(of: v)
             }
             merged.sort { $0.stamp < $1.stamp }
-            data[item.key] = merged
+            data[ByteKey(item.key)] = merged
         } else {
             guard !item.versions.isEmpty else { return }
-            data[item.key] = item.versions
-            if !SystemKeys.isSystem(item.key) { index.insert(item.key) }
+            data[ByteKey(item.key)] = item.versions
+            indexInsert(item.key)
             approximateBytes += item.key.count + 48
             versionCount += item.versions.count
             for v in item.versions { approximateBytes += Self.size(of: v) }
@@ -184,19 +200,20 @@ final class VersionedStore {
 
     /// Deletes all data for keys in `slots`.
     func drop(slots: SlotSet) {
-        let doomed = data.keys.filter { slots.contains(Slots.slot(for: $0)) }
+        let doomed = data.keys.map(\.bytes).filter { slots.contains(Slots.slot(for: $0)) }
         for key in doomed {
-            for v in data[key]! { approximateBytes -= Self.size(of: v) }
-            versionCount -= data[key]!.count
+            for v in data[ByteKey(key)]! { approximateBytes -= Self.size(of: v) }
+            versionCount -= data[ByteKey(key)]!.count
             approximateBytes -= key.count + 48
-            data[key] = nil
-            index.remove(key)
+            data[ByteKey(key)] = nil
+            indexRemove(key)
         }
     }
 
     func removeAll() {
         data = [:]
         index.removeAll()
+        systemIndex.removeAll()
         versionCount = 0
         approximateBytes = 0
         gcQueue = Deque()

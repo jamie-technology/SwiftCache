@@ -13,7 +13,7 @@ rm -rf "$L" && mkdir -p "$L"
 export SWIFTCACHE_CLUSTER=127.0.0.1:4500,127.0.0.1:4501,127.0.0.1:4502
 run() {
   $B/swiftcache-server --class "$1" --listen "127.0.0.1:$2" --advertise "127.0.0.1:$2" \
-    --coordinators "$SWIFTCACHE_CLUSTER" --replication 2 --health-port 0 --log-level ${LOG_LEVEL:-info} "${@:3}" >> "$L/p$2.log" 2>&1 &
+    --coordinators "$SWIFTCACHE_CLUSTER" --replication 2 --proxies "${PROXIES:-1}" ${INFLIGHT:+--max-inflight-batches $INFLIGHT} --health-port 0 --log-level ${LOG_LEVEL:-info} "${@:3}" >> "$L/p$2.log" 2>&1 &
 }
 for p in 4500 4501 4502; do run stateless $p --coordinator --data-dir "$L/d$p"; done
 for p in 4510 4511 4512; do run log $p; done

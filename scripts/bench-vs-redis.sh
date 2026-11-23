@@ -17,6 +17,10 @@ CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-32 256}"
 VALUE_SIZE="${VALUE_SIZE:-100}"
 KEYS="${KEYS:-10000}"
 SECONDS_PER_TEST="${SECONDS_PER_TEST:-15}"
+MODES="${MODES:-get set txn}"
+# SwiftCache client I/O threads. Benchmark tasks run on them (`--executor loop`); one is
+# fastest on a 4-vCPU node, where every extra client thread competes with the servers.
+# (redis-benchmark is single-threaded too.)  REDIS=0 skips the Redis runs.
 
 $K apply -f - >/dev/null <<EOF
 apiVersion: apps/v1
@@ -51,14 +55,16 @@ run() {
 }
 
 for CONCURRENCY in $CONCURRENCY_LEVELS; do
+if [[ "${REDIS:-1}" == 1 ]]; then
 echo "== Redis 7, $CONCURRENCY clients (redis-benchmark -d $VALUE_SIZE -r $KEYS, no pipelining)"
 N=$((CONCURRENCY * 3000))
 run redis:7.4-alpine redis-benchmark -h redis -c "$CONCURRENCY" -n "$N" -d "$VALUE_SIZE" -r "$KEYS" -t set,get --csv \
   | tr -d '"' | awk -F, 'NR==1{next} {printf "%s: %.0f ops/s  p50=%sms p99=%sms max=%sms\n", tolower($1), $2, $5, $7, $8}'
+fi
 
 echo "== SwiftCache, $CONCURRENCY clients (same value size and key space)"
-for mode in get set txn; do
+for mode in $MODES; do
   run "$IMAGE" swiftcache-cli bench --mode "$mode" --concurrency "$CONCURRENCY" --value-size "$VALUE_SIZE" \
-    --keys "$KEYS" --seconds "$SECONDS_PER_TEST" --threads 4
+    --keys "$KEYS" --seconds "$SECONDS_PER_TEST" --threads "${THREADS:-1}"
 done
 done

@@ -71,3 +71,15 @@ public enum LittleEndianInt64 {
         return (0..<8).map { UInt8(truncatingIfNeeded: v >> (8 * UInt64($0))) }
     }
 }
+
+/// A byte string as a hash key. `[UInt8]`'s own `Hashable` conformance feeds the hasher
+/// one byte at a time through a protocol witness, which dominated profiles of the
+/// resolver and storage; this hashes the whole buffer in one call.
+public struct ByteKey: Hashable, Sendable {
+    public var bytes: Bytes
+    @inlinable public init(_ bytes: Bytes) { self.bytes = bytes }
+    @inlinable public func hash(into hasher: inout Hasher) {
+        bytes.withUnsafeBytes { hasher.combine(bytes: $0) }
+    }
+    @inlinable public static func == (a: ByteKey, b: ByteKey) -> Bool { a.bytes == b.bytes }
+}

@@ -23,6 +23,8 @@ public final class CoordinatorRole: Role {
     private var nomineeRefreshed: UInt64 = 0
     private var candidates: [Endpoint: (info: LeaderInfo, lastSeen: UInt64)] = [:]
     private var abstainUntil: UInt64 = 0
+    /// The last candidate that heartbeated as leader, and when.
+    private var recentLeader: (info: LeaderInfo, at: UInt64)?
 
     // Generation register (durable).
     private(set) var readBallot = Ballot.zero
@@ -54,6 +56,11 @@ public final class CoordinatorRole: Role {
         context.disk.write(Self.diskKey, w.bytes)
     }
 
+    /// The candidate this coordinator currently holds a live lease for (checks).
+    public var liveNominee: LeaderInfo? { nomineeLive ? nominee : nil }
+    /// Restarted recently: nominates no one until a lease it may have granted expired.
+    public var abstaining: Bool { context.now < abstainUntil }
+
     private var nomineeLive: Bool {
         nominee != nil && context.now &- nomineeRefreshed < config.leaseTimeout
     }
@@ -64,9 +71,12 @@ public final class CoordinatorRole: Role {
         case .candidacy(let rid, let info):
             candidates[info.endpoint.processAddress] = (info, now)
             if !nomineeLive && now >= abstainUntil {
-                // Nominate the best recent candidate (deterministic so coordinators agree).
+                // Nominate a candidate seen heartbeating as leader recently (a majority
+                // elected it: join it), else the best recent candidate (deterministic so
+                // coordinators agree).
                 let recent = candidates.values.filter { now &- $0.lastSeen < config.leaseTimeout / 2 }
-                if let best = recent.map(\.info).min(by: { $0.endpoint < $1.endpoint }) {
+                let leader = recentLeader.flatMap { now &- $0.at < config.leaseTimeout / 2 ? $0.info : nil }
+                if let best = leader ?? recent.map(\.info).min(by: { $0.endpoint < $1.endpoint }) {
                     if nominee != best { context.log(.info, "nominating \(best.endpoint)") }
                     nominee = best
                     nomineeRefreshed = now
@@ -75,6 +85,16 @@ public final class CoordinatorRole: Role {
             context.send(.nominationReply(rid: rid, nomineeLive ? nominee : nil), to: from)
 
         case .leaderHeartbeat(let rid, let info):
+            recentLeader = (info, now)
+            // Free to nominate (no live lease, not abstaining): back the leader that is
+            // heartbeating. Only adds backing to a leader a majority already elected, and
+            // keeps coordinators outside that majority from pointing clients at a candidate
+            // that never became controller.
+            if !nomineeLive && now >= abstainUntil {
+                if nominee != info { context.log(.info, "nominating \(info.endpoint) (leader heartbeat)") }
+                nominee = info
+                nomineeRefreshed = now
+            }
             let ok = nominee == info && nomineeLive
             if ok { nomineeRefreshed = now }
             context.send(.heartbeatReply(rid: rid, ok: ok), to: from)
@@ -118,10 +138,31 @@ public final class CandidateRole: Role {
     let makeController: (LeaderInfo) -> ClusterController
 
     private var info: LeaderInfo
-    public private(set) var isLeader = false
+    /// This candidate's identity in elections.
+    public var identity: LeaderInfo { info }
+
+    private enum Leadership {
+        case none
+        /// A majority nominated us. A nomination's lease runs from when the coordinator
+        /// granted it, possibly long before, so we don't lead until a majority acknowledges
+        /// a heartbeat (which refreshes their leases on receipt, after we sent it).
+        case confirming(since: UInt64)
+        case leading
+    }
+    private var leadership = Leadership.none
     private var controllerEndpoint: Endpoint?
+    /// Send time of the latest heartbeat round a majority acknowledged.
     private var lastMajority: UInt64 = 0
     private var round: UInt64 = 0
+
+    /// Leader only while our lease holds by our own clock: a heartbeat round sent within
+    /// `leaderStepDownTimeout` was acknowledged by a majority. Checked before every event
+    /// this process handles, so a leader that wakes from a stall past its lease steps down
+    /// before acting on anything.
+    public var isLeader: Bool {
+        if case .leading = leadership { return context.now &- lastMajority <= config.leaderStepDownTimeout }
+        return false
+    }
 
     init(context: RoleContext, config: ClusterConfig, coordinators: [Endpoint], host: ProcessHost,
          makeController: @escaping (LeaderInfo) -> ClusterController) {
@@ -135,7 +176,19 @@ public final class CandidateRole: Role {
 
     public func start() {
         newIdentity()
+        host.beforeEvent { [weak self] in self?.checkLease() }
         context.every(config.leaderHeartbeatInterval) { [weak self] in self?.tick() }
+    }
+
+    private func checkLease() {
+        switch leadership {
+        case .leading where !isLeader:
+            stepDown(reason: "lost majority of coordinator leases")
+        case .confirming(let since) where context.now &- since > config.leaderStepDownTimeout:
+            stepDown(reason: "election not confirmed by a majority of heartbeats")
+        default:
+            break
+        }
     }
 
     private func newIdentity() {
@@ -145,58 +198,66 @@ public final class CandidateRole: Role {
 
     private func tick() {
         round += 1
-        let thisRound = round
-        if isLeader {
-            if let ep = controllerEndpoint, host.roles[ep] == nil {
-                stepDown(reason: "controller role stopped")
-                return
-            }
-            if context.now &- lastMajority > config.leaderStepDownTimeout {
-                stepDown(reason: "lost majority of coordinator leases")
-                return
-            }
-            var acks = 0
-            // Leases are measured from when the heartbeat was *sent*: a coordinator
-            // refreshes the lease no earlier than that, so our view never outlives theirs.
-            let sentAt = context.now
-            for c in coordinators {
-                context.request(to: c, timeout: config.leaderHeartbeatInterval * 2, { .leaderHeartbeat(rid: $0, self.info) }) { [weak self] reply in
-                    guard let self, self.isLeader, case .heartbeatReply(_, let ok)? = reply else { return }
-                    if ok {
-                        acks += 1
-                        if acks == majority(self.coordinators.count) { self.lastMajority = max(self.lastMajority, sentAt) }
-                    } else if thisRound == self.round {
-                        // A coordinator has moved on: we may no longer hold a majority.
-                    }
-                }
-            }
-        } else {
-            var votes = 0
-            let me = info
-            for c in coordinators {
-                context.request(to: c, timeout: config.leaderHeartbeatInterval * 2, { .candidacy(rid: $0, me) }) { [weak self] reply in
-                    guard let self, !self.isLeader, self.info == me, case .nominationReply(_, let nominee)? = reply else { return }
-                    if nominee == me {
-                        votes += 1
-                        if votes == majority(self.coordinators.count) { self.becomeLeader() }
-                    }
+        switch leadership {
+        case .leading:
+            if let ep = controllerEndpoint, host.roles[ep] == nil { return stepDown(reason: "controller role stopped") }
+            checkLease()
+            if case .leading = leadership { heartbeat() }
+        case .confirming:
+            checkLease()
+            if case .confirming = leadership { heartbeat() }
+        case .none:
+            campaign()
+        }
+    }
+
+    private func campaign() {
+        var votes = 0
+        let me = info
+        for c in coordinators {
+            context.request(to: c, timeout: config.leaderHeartbeatInterval * 2, { .candidacy(rid: $0, me) }) { [weak self] reply in
+                guard let self, case .none = self.leadership, self.info == me,
+                      case .nominationReply(_, let nominee)? = reply, nominee == me else { return }
+                votes += 1
+                if votes == majority(self.coordinators.count) {
+                    self.leadership = .confirming(since: self.context.now)
+                    self.heartbeat()
                 }
             }
         }
     }
 
-    private func becomeLeader() {
-        isLeader = true
-        lastMajority = context.now
-        context.log(.info, "elected cluster controller \(info.endpoint)")
-        let cc = makeController(info)
-        controllerEndpoint = cc.context.endpoint
-        host.add(cc)
+    private func heartbeat() {
+        var acks = 0
+        let me = info
+        // Leases are measured from when the heartbeat was *sent*: a coordinator
+        // refreshes the lease no earlier than that, so our view never outlives theirs.
+        let sentAt = context.now
+        for c in coordinators {
+            context.request(to: c, timeout: config.leaderHeartbeatInterval * 2, { .leaderHeartbeat(rid: $0, me) }) { [weak self] reply in
+                guard let self, self.info == me, case .heartbeatReply(_, true)? = reply else { return }
+                acks += 1
+                guard acks == majority(self.coordinators.count) else { return }
+                switch self.leadership {
+                case .none: return
+                case .leading: self.lastMajority = max(self.lastMajority, sentAt)
+                case .confirming:
+                    self.lastMajority = sentAt
+                    self.leadership = .leading
+                    guard self.isLeader else { return self.stepDown(reason: "heartbeat acks arrived after the lease they grant expired") }
+                    self.context.log(.info, "elected cluster controller \(self.info.endpoint)")
+                    let cc = self.makeController(self.info)
+                    self.controllerEndpoint = cc.context.endpoint
+                    self.host.add(cc)
+                }
+            }
+        }
     }
 
     private func stepDown(reason: String) {
         context.log(.warning, "stepping down as cluster controller: \(reason)")
-        isLeader = false
+        leadership = .none
+        lastMajority = 0
         if let ep = controllerEndpoint { host.remove(ep) }
         controllerEndpoint = nil
         newIdentity()

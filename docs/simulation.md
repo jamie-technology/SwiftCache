@@ -82,6 +82,7 @@ loses every replica and no generation loses every log:
 | `coordinatorQuorumLoss` | Kill 2 of 3 coordinators for 5 s | No new generation forms without quorum; the running one keeps committing; recovery after they return |
 | `masterPause` | Freeze the running master for 0.45 s or 2 s, four times | A master that wakes with an expired lease never hands out a stale read version |
 | `delayedOldGeneration` | Hold everything the running master sends (lease renewals, read versions, forwarded resolutions) for 3 s while it keeps working, then release it all | A new generation forms meanwhile; the released messages can't extend old authority, change new state or give a client a stale version |
+| `lostPushes` | Lose every push to one log for 400 ms, three times (well under failure detection) | Proxies re-push uncommitted batches: the same generation resumes committing without a recovery; no acknowledged commit lost |
 | `logPauseDuringRecovery` | Crash the master while freezing a log (holding back its lock reply) | Recovery waits out the lease on the frozen log or proceeds with the others, correctly either way |
 
 ### Timing assumptions
@@ -104,7 +105,10 @@ under these assumptions; it can't prove the real runtime meets them.
 
 - At most one master ever completes recovery of a given generation.
 - Each generation's first version is above everything the previous generation committed.
-- Never two processes that both believe they are the controller.
+- Never two processes that both believe they are the controller (a leader believes so only
+  while its lease is valid by its own clock).
+- While a candidate believes it leads, no majority could nominate anyone else: a majority
+  of coordinators hold a live lease for it, are down, or are abstaining after a restart.
 
 **By workloads:**
 
@@ -119,8 +123,10 @@ under these assumptions; it can't prove the real runtime meets them.
 | **global** | No versionstamp is ever handed to two commits. |
 
 **At the end**, after healing and quiescing: every invariant is re-checked by a fresh client;
-all active replicas of each shard hold identical data at a common version; every workload
-made progress; and the cluster has a controller and fully replicated shards.
+all active replicas of each shard hold identical data at a common version; the running
+generation's logs have released what storage popped (no unbounded retention); every live
+coordinator names the actual controller; every
+workload made progress; and the cluster has a controller and fully replicated shards.
 
 ## Bugs the simulator found
 
@@ -158,6 +164,35 @@ made progress; and the cluster has a controller and fully replicated shards.
     on every log yet), so recovery discarded it, and the history it had replaced was already
     gone. The cluster came back with an empty map. Fix: compact only once the snapshot is
     known committed on every log.
+
+**Performance III (November 2026):**
+
+12. **Logs never released memory.** Garbage collection used the minimum popped version over
+    *all* tags, including the metadata tag, which only advances when a shard-map snapshot
+    commits (once per generation). Logs therefore kept every entry they ever received
+    (hundreds of MB after minutes of load, against 1 GiB pod limits), and recovery copied
+    all of it. Fix: release data by the storage tags' floor, keeping only unsuperseded
+    shard-map metadata. The end-of-run retention check fails on the old code.
+13. **A newly elected controller's lease could outlive the coordinators'.** A candidate
+    counted nominations as a lease starting at election time, but a coordinator's
+    nomination lease runs from when it was granted, possibly long before. Another
+    candidate could be nominated by a majority while the first still believed it led
+    (two controllers with valid leases). Fix: an elected candidate leads only once a
+    majority acknowledges a heartbeat, its lease measured from that heartbeat's send; and
+    it checks the lease before every event, so a leader resuming from a stall steps down
+    before acting. The "no majority could nominate anyone else" check fails on 3 of 160
+    seeds with the old logic and on none with the fix.
+14. **A coordinator outside the electing majority pointed clients at a non-controller.**
+    It kept nominating a candidate that never won (leaders only heartbeat, which it
+    ignored), so roughly one client connection in nine failed with "controller
+    unreachable". Found by the k3s test; now caught by an end-of-run check that every
+    coordinator names the controller. Fix: a coordinator free to nominate prefers (and
+    adopts) a candidate heartbeating as leader, and clients try the other coordinators.
+
+Found outside the simulator in the same round: the server ignored SIGTERM (it runs as PID 1
+in its container, where unhandled signals are ignored), so a deleted pod kept running every
+role, and could even run a recovery, until SIGKILL at the end of its grace period. It now
+exits on SIGTERM.
 
 ## Writing new workloads
 

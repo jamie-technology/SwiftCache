@@ -284,7 +284,16 @@ public final class MasterRole: Role {
         lastVersion = recoveryVersion
         minNextVersion = highestOldVersion + 1
         committed = recoveryVersion
-        let workers = pick(spec.statelessWorkers, Int(spec.proxies), offset: Int(spec.recoveryID % 5) + 1)
+        // The first proxy shares this process (with the sequencer and resolver): its
+        // version/resolution round trip and committed-version notices never touch the
+        // network, so a commit through it takes only client -> proxy -> logs -> here -> client.
+        var workers = pick(spec.statelessWorkers, Int(spec.proxies), offset: Int(spec.recoveryID % 5) + 1)
+        let myWorker = ServerProcess.workerEndpoint(context.processAddress)
+        if spec.statelessWorkers.contains(myWorker), !workers.isEmpty {
+            workers.removeAll { $0 == myWorker }
+            workers.insert(myWorker, at: 0)
+            workers = Array(workers.prefix(Int(spec.proxies)))
+        }
         let jobs = workers.enumerated().map { i, w in
             (w, RoleSpec.proxy(ProxySpec(generation: generation, index: UInt32(i), startVersion: recoveryVersion,
                                          master: context.endpoint, resolvers: resolvers, tlogs: tlogs,

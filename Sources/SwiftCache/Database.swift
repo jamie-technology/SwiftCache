@@ -72,6 +72,33 @@ public final class Database: Sendable {
         try await run(idempotent: idempotent, body)
     }
 
+    /// Where one `transaction` call spent its time (for benchmarks and diagnostics).
+    public struct TransactionReport: Sendable {
+        /// Attempts made (1 = committed first time).
+        public var attempts = 0
+        /// Errors that caused a retry, in order.
+        public var retryReasons: [SwiftCacheError] = []
+        /// Time spent sleeping between attempts (µs).
+        public var backoffMicros: UInt64 = 0
+        /// Time spent waiting for read versions, storage reads and commits, summed over
+        /// attempts (µs).
+        public var readVersionMicros: UInt64 = 0
+        public var readMicros: UInt64 = 0
+        public var commitMicros: UInt64 = 0
+    }
+
+    /// Like `transaction`, but also reports attempts, backoff and per-phase time, whether
+    /// it succeeds or fails.
+    public func transactionWithReport<T>(idempotent: Bool = false, _ body: (Transaction) async throws -> T) async -> (result: Result<T, any Error>, report: TransactionReport) {
+        var report = TransactionReport()
+        do {
+            let r = try await run(idempotent: idempotent, report: &report, body)
+            return (.success(r.result), report)
+        } catch {
+            return (.failure(error), report)
+        }
+    }
+
     /// Runs a read-only transaction pinned to a historical `version` (e.g. one returned
     /// by `readVersion()` or a versionstamp's `version`). Every read sees the database
     /// exactly as it was at that version. Fails with `transactionTooOld` if the version is
@@ -79,6 +106,12 @@ public final class Database: Sendable {
     public func read<T>(atVersion version: Version, _ body: (Transaction) async throws -> T) async throws -> T {
         try await run(pinnedVersion: version, idempotent: false, body).result
     }
+
+    /// Task executors, one per client I/O thread. Running work on one of them (e.g.
+    /// `Task(executorPreference: db.taskExecutors[i]) { ... }`) keeps each request on a
+    /// single thread from call to reply, which roughly halves client CPU per operation
+    /// under load. Optional: the client works from any executor. Empty in simulation.
+    public var taskExecutors: [any TaskExecutor] { client.transport.taskExecutors }
 
     /// Creates a transaction you drive manually (call `commit()` yourself; no retries).
     public func createTransaction() -> Transaction {
@@ -91,18 +124,29 @@ public final class Database: Sendable {
 
     private func run<T>(pinnedVersion: Version? = nil, idempotent: Bool,
                         _ body: (Transaction) async throws -> T) async throws -> (result: T, versionstamp: Versionstamp?) {
+        var report = TransactionReport()
+        return try await run(pinnedVersion: pinnedVersion, idempotent: idempotent, report: &report, body)
+    }
+
+    private func run<T>(pinnedVersion: Version? = nil, idempotent: Bool, report: inout TransactionReport,
+                        _ body: (Transaction) async throws -> T) async throws -> (result: T, versionstamp: Versionstamp?) {
         counters.transactions.add(1, ordering: .relaxed)
         let operationID: Bytes? = idempotent ? randomID() : nil
         // Results of attempts whose commit outcome is unknown, by attempt id.
         var unknownAttempts: [UInt64: T] = [:]
+        // The lowest read version among those attempts: any of them that committed did so
+        // at a version above it, so its batch record lies above it.
+        var unknownSince: Version = .max
         var tries = 0
         var backoff = options.initialBackoff
         while true {
             let attemptID = client.transport.random(.max) | 1
             let tr = Transaction(client: client, readVersion: pinnedVersion)
+            report.attempts += 1
+            defer { report.add(tr.timings) }
             if let operationID { tr.makeIdempotent(id: operationID, attemptID: attemptID, retention: options.idempotencyRetention) }
             do {
-                if !unknownAttempts.isEmpty, let record = try await tr.idempotencyRecord(),
+                if !unknownAttempts.isEmpty, let record = try await tr.idempotencyRecord(since: unknownSince),
                    let result = unknownAttempts[record.attemptID] {
                     // An earlier attempt did commit.
                     return (result, record.stamp)
@@ -113,6 +157,7 @@ public final class Database: Sendable {
                     return (result, stamp)
                 } catch SwiftCacheError.commitUnknownResult where operationID != nil {
                     unknownAttempts[attemptID] = result
+                    if let v = tr.commitReadVersion { unknownSince = min(unknownSince, v) } else { unknownSince = 0 }
                     throw SwiftCacheError.commitUnknownResult
                 }
             } catch let error as SwiftCacheError {
@@ -127,10 +172,13 @@ public final class Database: Sendable {
                 guard retryable else { throw error }
                 tries += 1
                 counters.retries.add(1, ordering: .relaxed)
+                report.retryReasons.append(error)
                 if tries >= options.maxRetries { throw SwiftCacheError.retryLimitExceeded(last: error.description) }
                 if tries == 1 && error == .notCommitted { continue }  // retry a first conflict right away
                 let jitter = client.transport.random(backoff / 2 + 1)
+                let t0 = client.transport.now()
                 try await client.transport.sleep(micros: backoff / 2 + jitter)
+                report.backoffMicros += client.transport.now() &- t0
                 backoff = min(options.maxBackoff, backoff * 2)
             }
         }
@@ -173,9 +221,10 @@ public final class Database: Sendable {
                 // commit acknowledged before this call, observed before the call returns.
                 // Otherwise (a lagging replica) read at R.
                 let topology = try await client.topology()
-                async let latest = client.readLatest(k, topology: topology)
+                let latest = ResultBox<ClusterClient.LatestValue?>()
+                client.readLatest(k, topology: topology, into: latest)
                 let version = try await client.readVersion()
-                if let l = await latest, l.version >= version {
+                if let l = await latest.value, l.version >= version {
                     return l.value.map { VersionedEntry(key: k, bytes: $0, versionstamp: l.stamp) }
                 }
                 let (value, stamp) = try await client.read(k, at: version)
@@ -257,5 +306,13 @@ public final class Database: Sendable {
     /// Per-server statistics (key counts, memory, versions).
     public func storageStats(_ endpoint: String) async throws -> StorageStats {
         try await client.storageStats(endpoint)
+    }
+}
+
+extension Database.TransactionReport {
+    mutating func add(_ t: Transaction.Timings) {
+        readVersionMicros += t.readVersion
+        readMicros += t.reads
+        commitMicros += t.commit
     }
 }

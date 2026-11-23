@@ -21,6 +21,10 @@ public final class TLogRole: Role {
     private var leaseExpiry: UInt64 = 0
     public var generation: UInt64 { spec.generation }
     private var entries = Deque<LogEntry>()
+    /// Metadata-tag history from entries already released by every storage tag: kept
+    /// (stripped of data) until a committed snapshot supersedes it, so recovery can still
+    /// rebuild the shard map, without retaining the data those entries carried.
+    private var metaHistory = Deque<LogEntry>()
     /// Last version appended.
     public private(set) var durable: Version = 0
     /// Highest version known to be on every log of the generation (safe to expose).
@@ -57,6 +61,12 @@ public final class TLogRole: Role {
     public func debugTags(at version: Version) -> [[Tag]]? {
         entries.elements.first { $0.version == version }.map { $0.messages.map(\.tags) }
     }
+
+    /// Versions retained (with data, and metadata-only), for leak checks.
+    public var retainedVersions: (entries: Int, metaOnly: Int) { (entries.count, metaHistory.count) }
+
+    /// Data at or below this version has been released by every storage tag.
+    public var dataFloor: Version? { popped.filter { $0.key != metadataTag }.values.min() }
 
     public func start() {
         durable = spec.startVersion
@@ -109,6 +119,15 @@ public final class TLogRole: Role {
                 context.send(.tlogPeekReply(rid: old.rid, PeekReply(status: .ok, entries: [], end: old.after)), to: old.from)
             }
             handlePeek(rid: rid, tag: tag, after: after, upTo: upTo, need: need, from: from, waiterID: nil)
+        case .tlogNeed(let tag, let need):
+            // Raise the need of this consumer's held peek; if it was already answered the
+            // note is moot (the consumer's next peek carries its needs).
+            guard let i = peekWaiters.firstIndex(where: { $0.from == from && $0.tag == tag }) else { return }
+            peekWaiters[i].need = max(peekWaiters[i].need, need)
+            if knownCommitted >= need && need > peekWaiters[i].after {
+                let w = peekWaiters.remove(at: i)
+                handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, need: w.need, from: w.from, waiterID: w.id)
+            }
         case .tlogPop(let tag, let version):
             if let p = popped[tag], version > p {
                 popped[tag] = version
@@ -144,9 +163,11 @@ public final class TLogRole: Role {
         case .tlogConfirm(let rid, let generation):
             context.send(.tlogConfirmReply(rid: rid, ok: ready && !locked && generation == spec.generation), to: from)
         case .tlogFetch(let rid, let upTo):
-            let es = entries.elements.filter { $0.version <= upTo }
+            // Released entries survive only as metadata history; both are in version order
+            // and every history entry precedes every retained entry.
+            let es = metaHistory.elements.filter { $0.version <= upTo } + entries.elements.filter { $0.version <= upTo }
             let pops = popped.keys.sorted().map { (tag: $0, version: popped[$0]!) }
-            context.send(.tlogFetchReply(rid: rid, FetchReply(ok: ready, entries: Array(es), popped: pops)), to: from)
+            context.send(.tlogFetchReply(rid: rid, FetchReply(ok: ready, entries: es, popped: pops)), to: from)
         default:
             if let rid = message.rid, !message.isReply { context.send(.errorReply(rid: rid, .invalidRequest), to: from) }
         }
@@ -159,16 +180,13 @@ public final class TLogRole: Role {
             context.send(.tlogPushReply(rid: rid, ok: false), to: from)
             return
         }
-        if push.entry.version <= durable {
-            // A retransmission of something we already have.
-            context.send(.tlogPushReply(rid: rid, ok: true), to: from)
-            return
-        }
+        // Success isn't acknowledged to the proxy: durability goes to the master, whose
+        // committed version completes the commit. Only refusals are answered.
+        if push.entry.version <= durable { return }  // a retransmission of something we have
         pendingPushes[push.prevVersion] = (from, rid, push)
         var appended = false
         while let next = pendingPushes.removeValue(forKey: durable) {
             append(next.push)
-            context.send(.tlogPushReply(rid: next.rid, ok: true), to: next.from)
             appended = true
         }
         if appended {
@@ -217,15 +235,30 @@ public final class TLogRole: Role {
 
     /// A committed snapshot supersedes everything older on the metadata tag.
     private func compactSnapshots() {
+        var compacted = false
         while let s = pendingSnapshots.first, s <= knownCommitted {
             pendingSnapshots.removeFirst()
             popped[metadataTag] = max(popped[metadataTag] ?? 0, s - 1)
+            compacted = true
         }
+        guard compacted, let floor = popped[metadataTag] else { return }
+        while let first = metaHistory.first, first.version <= floor { metaHistory.removeFirst() }
+        while let v = tagVersions[metadataTag]?.first, v <= floor { tagVersions[metadataTag]!.removeFirst() }
     }
 
+    /// Releases entries every storage tag has popped. The metadata tag doesn't hold data
+    /// back: its unreleased part of a released entry moves to `metaHistory`. (It used to
+    /// count towards the floor, and only advances when a snapshot commits, i.e. once per
+    /// generation, so logs retained every entry they ever received.)
     private func collectGarbage() {
-        guard let floor = popped.values.min() else { return }
-        while let first = entries.first, first.version <= floor { entries.removeFirst() }
+        let metaFloor = popped[metadataTag] ?? 0
+        guard let floor = dataFloor ?? (popped.isEmpty ? nil : knownCommitted) else { return }
+        while let first = entries.first, first.version <= floor {
+            entries.removeFirst()
+            guard first.version > metaFloor else { continue }
+            let meta = first.meta.filter { $0.tags.contains(metadataTag) }
+            if !meta.isEmpty { metaHistory.append(LogEntry(version: first.version, messages: [], meta: meta)) }
+        }
     }
 
     // MARK: Peeks

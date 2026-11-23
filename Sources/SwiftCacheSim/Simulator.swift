@@ -132,9 +132,11 @@ public final class Simulator: @unchecked Sendable {
 
     // Clients.
     final class ClientEndpoint {
-        var pending: [UInt64: CheckedContinuation<Message, any Error>] = [:]
+        var pending: [UInt64: @Sendable (Result<Message, any Error>) -> Void] = [:]
     }
     private var clients: [Endpoint: ClientEndpoint] = [:]
+    /// Drops matching messages as if lost on a broken connection (scenarios).
+    public var dropFilter: ((Message, Endpoint, Endpoint) -> Bool)?
     private var nextRid: UInt64 = 1
 
     // Network state.
@@ -313,6 +315,7 @@ public final class Simulator: @unchecked Sendable {
         }
         if isPartitioned(src) || isPartitioned(dst) { return }
         if let p = processes[src], !p.alive { return }
+        if let drop = dropFilter, drop(message, from, to) { return }  // lost in flight
         let link = Link(from: src, to: dst)
         let e = epoch(link)
         var latency = network.minLatency + random.below(network.maxLatency - network.minLatency + 1)
@@ -345,8 +348,8 @@ public final class Simulator: @unchecked Sendable {
         mixTrace(to)
         mixTrace(message.name)
         if let client = clients[to] {
-            if let rid = message.rid, let cont = client.pending.removeValue(forKey: rid) {
-                cont.resume(returning: message)
+            if let rid = message.rid, let completion = client.pending.removeValue(forKey: rid) {
+                completion(.success(message))
             }
             return
         }
@@ -416,14 +419,14 @@ public final class Simulator: @unchecked Sendable {
     }
 
     func clientRequest(from client: Endpoint, to: Endpoint, timeout: UInt64, _ make: (UInt64) -> Message,
-                       _ cont: CheckedContinuation<Message, any Error>) {
+                       _ completion: @escaping @Sendable (Result<Message, any Error>) -> Void) {
         let rid = nextRid
         nextRid += 1
-        clients[client]!.pending[rid] = cont
+        clients[client]!.pending[rid] = completion
         send(make(rid), from: client, to: to)
         schedule(after: timeout) { [weak self] in
             guard let self, let c = self.clients[client]!.pending.removeValue(forKey: rid) else { return }
-            c.resume(throwing: TransportError.timedOut(to))
+            c(.failure(TransportError.timedOut(to)))
         }
     }
 
@@ -431,6 +434,12 @@ public final class Simulator: @unchecked Sendable {
     public func spawn(_ body: @escaping @Sendable () async -> Void) {
         Task(executorPreference: executor) { await body() }
         executor.drain()
+    }
+
+    /// Queues a task on the deterministic executor without running it now (safe to call
+    /// from inside a running client task or event: it runs at the next drain).
+    func enqueueTask(_ body: @escaping @Sendable () async -> Void) {
+        Task(executorPreference: executor) { await body() }
     }
 
     // MARK: Logging, tracing, failures
@@ -546,11 +555,18 @@ public final class SimClientTransport: ClientTransport, @unchecked Sendable {
         self.endpoint = endpoint
     }
 
-    public func request(to endpoint: Endpoint, timeout: UInt64, _ make: (UInt64) -> Message) async throws -> Message {
-        try await withCheckedThrowingContinuation { cont in
-            sim.clientRequest(from: self.endpoint, to: endpoint, timeout: timeout, make, cont)
-        }
+    public func send(to endpoint: Endpoint, timeout: UInt64, _ make: (UInt64) -> Message,
+                     completion: @escaping @Sendable (Result<Message, any Error>) -> Void) {
+        sim.clientRequest(from: self.endpoint, to: endpoint, timeout: timeout, make, completion)
     }
+
+    public func spawn(_ body: @escaping @Sendable () async -> Void) {
+        sim.enqueueTask(body)
+    }
+
+    public var laneCount: Int { 1 }
+    public func currentLane() -> Int { 0 }
+    public var taskExecutors: [any TaskExecutor] { [] }
 
     public func sleep(micros: UInt64) async throws {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in

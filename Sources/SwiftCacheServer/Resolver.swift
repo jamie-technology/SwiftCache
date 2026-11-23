@@ -8,7 +8,7 @@ import SwiftCacheCore
 /// transaction also conflicts with earlier transactions of the same batch.
 struct ConflictSet {
     /// Last committed write version of each key written within the MVCC window.
-    private var lastWrite: [Bytes: Version] = [:]
+    private var lastWrite: [ByteKey: Version] = [:]
     /// Recent commits (version, sorted written keys), oldest first; used for range checks.
     private var recent = Deque<(version: Version, keys: [Bytes])>()
     /// Reads older than this are rejected (window edge or recovery point).
@@ -31,7 +31,7 @@ struct ConflictSet {
     mutating func resolve(_ req: ResolveTxn, commitVersion: Version) -> Outcome {
         if req.readVersion < oldestReadable { return .tooOld }
         for key in req.readKeys {
-            if let w = lastWrite[key], w > req.readVersion { return .conflict }
+            if let w = lastWrite[ByteKey(key)], w > req.readVersion { return .conflict }
         }
         if !req.readRanges.isEmpty {
             // Walk commits newer than the read version (newest first).
@@ -48,7 +48,7 @@ struct ConflictSet {
 
     private mutating func record(_ keys: [Bytes], at version: Version) {
         guard !keys.isEmpty else { return }
-        for key in keys { lastWrite[key] = version }
+        for key in keys { lastWrite[ByteKey(key)] = version }
         recent.append((version, keys.sorted(by: bytesLess)))
     }
 
@@ -70,7 +70,10 @@ struct ConflictSet {
         // write that last set it leaves the window.
         while let first = recent.first, first.version < oldest {
             recent.removeFirst()
-            for key in first.keys where lastWrite[key] == first.version { lastWrite[key] = nil }
+            for key in first.keys {
+                let k = ByteKey(key)
+                if let i = lastWrite.index(forKey: k), lastWrite.values[i] == first.version { lastWrite.remove(at: i) }
+            }
         }
     }
 

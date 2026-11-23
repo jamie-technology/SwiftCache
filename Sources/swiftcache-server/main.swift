@@ -29,6 +29,7 @@ struct Server: ParsableCommand {
     @Option(help: "Storage replicas per shard.") var replication: Int = 2
     @Option(help: "Transaction logs per generation.") var logs: Int = 3
     @Option(help: "Commit proxies per generation.") var proxies: Int = 2
+    @Option(help: "Commit batches a proxy keeps in flight (pushed, not yet durable).") var maxInflightBatches: Int?
     @Option(help: "MVCC window in seconds (how far back reads are served).") var mvccWindow: Double = 10
     @Option(help: "Seconds without a registration before a process is considered dead.") var failureTimeout: Double = 3
     @Option(help: "Seconds the last replica of a shard may be gone before its data is given up.") var shardLossTimeout: Double = 120
@@ -42,6 +43,7 @@ struct Server: ParsableCommand {
         config.replicationFactor = replication
         config.logReplicas = logs
         config.commitProxies = proxies
+        if let maxInflightBatches { config.maxInflightBatches = max(1, maxInflightBatches) }
         config.mvccWindow = UInt64(mvccWindow * 1_000_000)
         config.failureTimeout = UInt64(failureTimeout * 1_000_000)
         config.shardLossTimeout = UInt64(shardLossTimeout * 1_000_000)
@@ -63,6 +65,11 @@ struct Server: ParsableCommand {
         }
         let isCoordinator = coordinator
         let finalConfig = config
+        // Crash-only: SIGTERM (e.g. a pod being deleted) stops the process at once. Without a
+        // handler, PID 1 in a container ignores SIGTERM and keeps serving every role until
+        // the grace period's SIGKILL, acting meanwhile as if nothing happened.
+        signal(SIGTERM) { _ in _exit(0) }
+        signal(SIGINT) { _ in _exit(0) }
         let nodeHost = try NodeHost(address: advertise, dataDirectory: dataDir, logLevel: level)
         nodeHost.log(.info, "\(advertise): class=\(cls) coordinator=\(isCoordinator) coordinators=\(coordinators)")
         let holder = ProcessHolder()

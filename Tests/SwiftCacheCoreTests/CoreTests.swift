@@ -92,7 +92,7 @@ import Testing
             .commitBatch(rid: 28, [CommitRequest(readVersion: 3, mutations: [.add(key: [1], delta: 2)])]),
             .commitBatchReply(rid: 29, [.committed(Versionstamp(version: 7, order: 0)), .failed(.notCommitted)]),
             .tlogDurable(generation: 2, version: 10), .committedVersion(generation: 2, version: 10),
-            .tlogCommitted(generation: 2, version: 10), .tlogLease(rid: 30, generation: 2),
+            .tlogCommitted(generation: 2, version: 10), .tlogNeed(tag: 3, need: 11), .tlogLease(rid: 30, generation: 2),
             .tlogPeek(rid: 31, tag: 4, from: 5, upTo: 0, need: 9),
             .tlogPush(rid: 19, TLogPush(generation: 2, prevVersion: 9, entry: entry, knownCommitted: 8)),
             .tlogPeekReply(rid: 20, PeekReply(status: .ok, entries: [PeekEntry(version: 10, mutations: [(0, .clear(key: [1]))], meta: [])], end: 10)),
@@ -112,10 +112,17 @@ import Testing
         #expect(throws: (any Error).self) { try Message.decode([3, 1]) }
     }
 
-    @Test func idempotencyRecords() {
-        let v = SystemKeys.idempotencyValue(stamp: Versionstamp(version: 12, order: 3), attemptID: 99)
-        let parsed = SystemKeys.parseIdempotencyValue(v)
-        #expect(parsed?.stamp == Versionstamp(version: 12, order: 3) && parsed?.attemptID == 99)
+    @Test func idempotencyBatchRecords() {
+        let entries = [SystemKeys.IdempotencyEntry(id: Bytes(repeating: 7, count: 16), attemptID: 99, order: 3),
+                       SystemKeys.IdempotencyEntry(id: [1, 2], attemptID: .max, order: 0)]
+        let v = SystemKeys.idempotencyBatchValue(entries)
+        #expect(SystemKeys.parseIdempotencyBatchValue(v) == entries)
+        #expect(SystemKeys.parseIdempotencyBatchValue(Array(v.dropLast())) == nil)
+        // Keys sort in version order (range reads by version rely on it).
+        let a = SystemKeys.idempotencyBatch(255), b = SystemKeys.idempotencyBatch(256), c = SystemKeys.idempotencyBatch(1 << 40)
+        #expect(bytesLess(a, b) && bytesLess(b, c))
+        #expect(SystemKeys.idempotencyBatchVersion(c) == 1 << 40)
+        #expect(SystemKeys.isSystem(a) && SystemKeys.isIdempotencyBatch(a) && !SystemKeys.isIdempotencyBatch(SystemKeys.idempotency([1])))
     }
 }
 

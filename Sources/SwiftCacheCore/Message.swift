@@ -76,6 +76,9 @@ public enum Message: Hashable, Sendable {
     case tlogPeek(rid: UInt64, tag: Tag, from: Version, upTo: Version, need: Version)
     case tlogPeekReply(rid: UInt64, PeekReply)
     case tlogPop(tag: Tag, version: Version)
+    /// Storage -> log, one-way: a read is waiting for `need`; answer this consumer's held
+    /// peek for `tag` as soon as `need` is committed (instead of a superseding peek).
+    case tlogNeed(tag: Tag, need: Version)
     case tlogLock(rid: UInt64, generation: UInt64)
     case tlogLockReply(rid: UInt64, LockReply)
     case tlogConfirm(rid: UInt64, generation: UInt64)
@@ -112,7 +115,7 @@ public enum Message: Hashable, Sendable {
              .tlogLock(let r, _), .tlogLockReply(let r, _), .tlogConfirm(let r, _), .tlogConfirmReply(let r, _),
              .tlogFetch(let r, _), .tlogFetchReply(let r, _), .tlogLease(let r, _):
             return r
-        case .moveReady, .serverDBInfo, .halt, .tlogPop, .tlogCommitted, .tlogDurable, .committedVersion:
+        case .moveReady, .serverDBInfo, .halt, .tlogPop, .tlogNeed, .tlogCommitted, .tlogDurable, .committedVersion:
             return nil
         }
     }
@@ -209,6 +212,7 @@ extension Message {
         case .tlogPeek(let rid, let tag, let from, let upTo, let need): w.u8(52); w.u64(rid); w.u32(tag); w.u64(from); w.u64(upTo); w.u64(need)
         case .tlogPeekReply(let rid, let p): w.u8(53); w.u64(rid); w.put(p)
         case .tlogPop(let tag, let v): w.u8(54); w.u32(tag); w.u64(v)
+        case .tlogNeed(let tag, let v): w.u8(68); w.u32(tag); w.u64(v)
         case .tlogLock(let rid, let g): w.u8(55); w.u64(rid); w.u64(g)
         case .tlogLockReply(let rid, let l): w.u8(56); w.u64(rid); w.put(l)
         case .tlogConfirm(let rid, let g): w.u8(57); w.u64(rid); w.u64(g)
@@ -293,6 +297,7 @@ extension Message {
         case 52: return .tlogPeek(rid: try r.u64(), tag: try r.u32(), from: try r.u64(), upTo: try r.u64(), need: try r.u64())
         case 53: return .tlogPeekReply(rid: try r.u64(), try r.get())
         case 54: return .tlogPop(tag: try r.u32(), version: try r.u64())
+        case 68: return .tlogNeed(tag: try r.u32(), need: try r.u64())
         case 55: return .tlogLock(rid: try r.u64(), generation: try r.u64())
         case 56: return .tlogLockReply(rid: try r.u64(), try r.get())
         case 57: return .tlogConfirm(rid: try r.u64(), generation: try r.u64())

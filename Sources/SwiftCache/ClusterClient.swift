@@ -36,28 +36,31 @@ final class ClusterClient: Sendable {
         self.transport = transport
         self.options = options
         let me = WeakRef<ClusterClient>()
-        self.grvCoalescer = Coalescer<Int, Version>(maxBatch: .max) { items in
-            let r: Result<Version, any Error>
-            if let client = me.value {
-                do { r = .success(try await client.fetchReadVersion()) } catch { r = .failure(error) }
-            } else {
-                r = .failure(SwiftCacheError.unavailable("client closed"))
-            }
-            return Array(repeating: r, count: items.count)
+        let lanes = max(1, transport.laneCount)
+        self.lanes = (0..<lanes).map { _ in
+            Lane(grv: Coalescer<Int, Version>(maxBatch: .max) { items, done in
+                guard let client = me.value else {
+                    return transport.spawn { done(Array(repeating: .failure(SwiftCacheError.unavailable("client closed")), count: items.count)) }
+                }
+                client.fetchReadVersion { r in done(Array(repeating: r, count: items.count)) }
+            })
         }
         me.value = self
     }
 
     // MARK: Discovery
 
-    private func findController() async throws -> Endpoint {
-        if let c = controller.withLock({ $0 }) { return c }
+    /// Asks coordinators for the controller, starting at a random one and skipping any in
+    /// `skip` (coordinators whose answer turned out not to host a controller).
+    private func findController(skip: Set<Endpoint> = []) async throws -> (controller: Endpoint, via: Endpoint?) {
+        if skip.isEmpty, let c = controller.withLock({ $0 }) { return (c, nil) }
         let start = Int(transport.random(UInt64(max(1, coordinators.count))))
         for i in 0..<coordinators.count {
             let c = coordinators[(start + i) % coordinators.count]
+            if skip.contains(c) { continue }
             if case .leaderReply(_, let leader?)? = try? await transport.request(to: c, timeout: options.requestTimeout, { .getLeader(rid: $0) }) {
                 controller.withLock { $0 = leader.endpoint }
-                return leader.endpoint
+                return (leader.endpoint, c)
             }
         }
         throw SwiftCacheError.unavailable("no coordinator knows a cluster controller")
@@ -65,8 +68,12 @@ final class ClusterClient: Sendable {
 
     func clientInfo(refresh: Bool = false) async throws -> ClientInfo {
         if !refresh, let info = cached.withLock({ $0 }) { return info }
-        for _ in 0..<2 {
-            let cc = try await findController()
+        // A coordinator outside the electing majority may name a candidate that isn't the
+        // controller: then try the others.
+        var skip = Set<Endpoint>()
+        for _ in 0...coordinators.count {
+            let (cc, via) = try await findController(skip: skip)
+            if let via { skip.insert(via) }
             let reply = try? await transport.request(to: cc, timeout: options.requestTimeout) { .getClientInfo(rid: $0) }
             switch reply {
             case .clientInfoReply(_, let info)?:
@@ -94,31 +101,39 @@ final class ClusterClient: Sendable {
 
     // MARK: Proxies
 
-    /// Concurrent read-version requests in this process share one request to a proxy.
-    private let grvCoalescer: Coalescer<Int, Version>
+    // Batching state is per transport lane, so a request issued on a lane's thread is
+    // batched, sent and completed on that thread.
 
-    /// Concurrent commits to the same proxy share one message (each is still resolved and
-    /// stamped individually by the proxy).
-    private let commitCoalescers = Mutex<[Endpoint: Coalescer<CommitRequest, CommitResult>]>([:])
+    final class Lane: Sendable {
+        /// Concurrent read-version requests on a lane share one request to the master.
+        let grv: Coalescer<Int, Version>
+        /// Concurrent commits to the same proxy share one message (each is still resolved
+        /// and stamped individually by the proxy).
+        let commits = Mutex<[Endpoint: Coalescer<CommitRequest, CommitResult>]>([:])
+        /// Concurrent point reads to the same storage server share one message.
+        let reads = Mutex<[Endpoint: Coalescer<ReadItem, ReadResult>]>([:])
+        init(grv: Coalescer<Int, Version>) { self.grv = grv }
+    }
+    private let lanes: [Lane]
+    private var lane: Lane { lanes[transport.currentLane()] }
 
     private func commitCoalescer(_ endpoint: Endpoint) -> Coalescer<CommitRequest, CommitResult> {
-        commitCoalescers.withLock { all in
+        lane.commits.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 4) { reqs in
-                do {
-                    let reply = try await transport.request(to: endpoint, timeout: timeout) { .commitBatch(rid: $0, reqs) }
-                    switch reply {
-                    case .commitBatchReply(_, let results) where results.count == reqs.count:
-                        return results.map { .success($0) }
-                    case .errorReply(_, let code):
+            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 4) { reqs, done in
+                transport.send(to: endpoint, timeout: timeout, { .commitBatch(rid: $0, reqs) }) { result in
+                    switch result {
+                    case .success(.commitBatchReply(_, let results)) where results.count == reqs.count:
+                        done(results.map { .success($0) })
+                    case .success(.errorReply(_, let code)):
                         // The proxy no longer exists: none of these were taken.
-                        return Array(repeating: .success(.failed(code)), count: reqs.count)
-                    default:
-                        return Array(repeating: .failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")), count: reqs.count)
+                        done(Array(repeating: .success(.failed(code)), count: reqs.count))
+                    case .success(let reply):
+                        done(Array(repeating: .failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")), count: reqs.count))
+                    case .failure(let error):
+                        done(Array(repeating: .failure(error), count: reqs.count))
                     }
-                } catch {
-                    return Array(repeating: .failure(error), count: reqs.count)
                 }
             }
             all[endpoint] = c
@@ -126,26 +141,22 @@ final class ClusterClient: Sendable {
         }
     }
 
-    /// Concurrent point reads to the same storage server share one message.
-    private let readCoalescers = Mutex<[Endpoint: Coalescer<ReadItem, ReadResult>]>([:])
-
     private func readCoalescer(_ endpoint: Endpoint) -> Coalescer<ReadItem, ReadResult> {
-        readCoalescers.withLock { all in
+        lane.reads.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 4) { items in
-                do {
-                    let reply = try await transport.request(to: endpoint, timeout: timeout) { .readBatch(rid: $0, items: items) }
-                    switch reply {
-                    case .readBatchReply(_, let results) where results.count == items.count:
-                        return results.map { .success($0) }
-                    case .errorReply(_, let code):
-                        return Array(repeating: .success(.error(code)), count: items.count)
-                    default:
-                        return Array(repeating: .failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")), count: items.count)
+            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 4) { items, done in
+                transport.send(to: endpoint, timeout: timeout, { .readBatch(rid: $0, items: items) }) { result in
+                    switch result {
+                    case .success(.readBatchReply(_, let results)) where results.count == items.count:
+                        done(results.map { .success($0) })
+                    case .success(.errorReply(_, let code)):
+                        done(Array(repeating: .success(.error(code)), count: items.count))
+                    case .success(let reply):
+                        done(Array(repeating: .failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")), count: items.count))
+                    case .failure(let error):
+                        done(Array(repeating: .failure(error), count: items.count))
                     }
-                } catch {
-                    return Array(repeating: .failure(error), count: items.count)
                 }
             }
             all[endpoint] = c
@@ -154,29 +165,46 @@ final class ClusterClient: Sendable {
     }
 
     func readVersion() async throws -> Version {
-        try await grvCoalescer.submit(0)
+        try await lane.grv.submit(0)
     }
 
-    private func fetchReadVersion() async throws -> Version {
+    /// Fetches a read version, calling back on the transport's thread. Synchronous up to
+    /// the send when cluster info is cached; otherwise fetches it in a task first.
+    private func fetchReadVersion(_ done: @escaping @Sendable (Result<Version, any Error>) -> Void) {
+        guard let info = cached.withLock({ $0 }) else {
+            return transport.spawn { [self] in
+                do {
+                    _ = try await clientInfo()
+                    fetchReadVersion(done)
+                } catch {
+                    done(.failure(error))
+                }
+            }
+        }
         // The master serves read versions in one round trip (under log leases); proxies
         // can too (with per-request log confirmation) if no master is advertised.
-        let info = try await clientInfo()
-        let p = info.master.isEmpty ? try await proxy() : info.master
-        let reply: Message
-        do {
-            reply = try await transport.request(to: p, timeout: options.requestTimeout) { .getReadVersion(rid: $0) }
-        } catch {
-            invalidate()
-            throw SwiftCacheError.unavailable("proxy \(p): \(error)")
+        let p: Endpoint
+        if !info.master.isEmpty {
+            p = info.master
+        } else if !info.proxies.isEmpty {
+            p = info.proxies[Int(transport.random(UInt64(info.proxies.count)))]
+        } else {
+            return transport.spawn { done(.failure(SwiftCacheError.unavailable("no commit proxies"))) }
         }
-        switch reply {
-        case .readVersionReply(_, let v):
-            observe(v)
-            return v
-        case .errorReply(_, let code):
-            invalidate()
-            throw SwiftCacheError(code: code)
-        default: throw SwiftCacheError.internalError("unexpected reply \(reply.name)")
+        transport.send(to: p, timeout: options.requestTimeout, { .getReadVersion(rid: $0) }) { [self] result in
+            switch result {
+            case .success(.readVersionReply(_, let v)):
+                observe(v)
+                done(.success(v))
+            case .success(.errorReply(_, let code)):
+                invalidate()
+                done(.failure(SwiftCacheError(code: code)))
+            case .success(let reply):
+                done(.failure(SwiftCacheError.internalError("unexpected reply \(reply.name)")))
+            case .failure(let error):
+                invalidate()
+                done(.failure(SwiftCacheError.unavailable("proxy \(p): \(error)")))
+            }
         }
     }
 
@@ -205,8 +233,10 @@ final class ClusterClient: Sendable {
     // MARK: Admin
 
     func status() async throws -> ClusterStatus {
-        for _ in 0..<2 {
-            let cc = try await findController()
+        var skip = Set<Endpoint>()
+        for _ in 0...coordinators.count {
+            let (cc, via) = try await findController(skip: skip)
+            if let via { skip.insert(via) }
             if case .statusReply(_, let s)? = try? await transport.request(to: cc, timeout: options.requestTimeout, { .getStatus(rid: $0) }) {
                 return s
             }
@@ -274,13 +304,19 @@ final class ClusterClient: Sendable {
         throw lastError
     }
 
-    /// Reads the latest value a replica of `key`'s shard has applied, with that version.
-    /// Returns nil if the replica can't answer (the caller falls back to a versioned read).
-    func readLatest(_ key: Bytes, topology topo: Topology) async -> (value: Bytes?, stamp: Versionstamp, version: Version)? {
-        guard let shard = topo.shard(forKey: key), !shard.replicas.isEmpty else { return nil }
+    typealias LatestValue = (value: Bytes?, stamp: Versionstamp, version: Version)
+
+    /// Reads the latest value a replica of `key`'s shard has applied, with that version,
+    /// into `box` (nil if the replica can't answer; the caller then falls back to a
+    /// versioned read). Callback-based so it can run alongside a read-version request
+    /// without a child task.
+    func readLatest(_ key: Bytes, topology topo: Topology, into box: ResultBox<LatestValue?>) {
+        guard let shard = topo.shard(forKey: key), !shard.replicas.isEmpty else { return box.set(nil) }
         let replica = shard.replicas[Int(transport.random(UInt64(shard.replicas.count)))]
-        guard case .valueAt(let v, let s, let ver)? = try? await readCoalescer(replica).submit(ReadItem(key: key, version: 0)) else { return nil }
-        return (v, s, ver)
+        readCoalescer(replica).submit(ReadItem(key: key, version: 0)) { result in
+            guard case .success(.valueAt(let v, let s, let ver)) = result else { return box.set(nil) }
+            box.set((v, s, ver))
+        }
     }
 
     /// Reads `[begin, end)` at `version` across all shards, merged in key order.

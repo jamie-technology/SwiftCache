@@ -35,7 +35,7 @@ it recovers into a new generation, fencing the old one.
 | **Master** | 1 per generation | Runs recovery, allocates commit versions (forwarding batches to the resolver), tracks the committed version from the logs' durability reports, serves read versions under log leases | Must write `CoreState` with its ballot before the generation goes live. A newer recovery's promise makes that write fail | In memory |
 | **Commit proxy** | N per generation | Batches commits, routes mutations to logs, writes idempotency records | Pushes go to logs that refuse once locked. Read versions require every log to confirm it's unlocked | Transient |
 | **Resolver** | 1 per generation | Decides conflicts in version order. Relays metadata changes between proxies | Rejects read versions from before its generation started | Per generation |
-| **Transaction log** | L per generation | Durability: a version is committed when *every* log of the generation has it. Grants the master's read-version lease | Locked by the next recovery (whose lock reply waits out the lease) | In memory |
+| **Transaction log** | L per generation | Durability: a version is committed when *every* log of the generation has it. Grants the master's read-version lease | Locked by the next recovery (whose lock reply waits out the lease) | In memory; releases data every storage tag has popped, keeping only unsuperseded shard-map metadata |
 | **Storage server** | shards × replicas | Holds data and serves multi-version reads | Only ever applies versions the logs report as committed | In memory |
 
 Every role is its own state machine with its own lifecycle. A *process* (one
@@ -68,10 +68,13 @@ unreachable one (must wait).
    request order and forwards the batch's conflict ranges to the resolver, which runs on
    the master's process (no extra network hop). The resolver decides each transaction in
    version order and replies **directly to the proxy** with the version, the verdicts, and
-   any metadata other proxies committed in between.
+   any metadata other proxies committed in between. The first proxy is recruited onto the
+   master's process too, so for commits through it this whole step is local.
 5. The proxy tags each mutation with the tags of the storage servers that own its slot (both
    owners during a migration) and pushes the version to **every** log. Logs append strictly
-   in `prevVersion` order.
+   in `prevVersion` order. Pushes are one-way: a log answers only to refuse (it is locked or
+   not ready), and the proxy re-pushes any batch the master hasn't declared committed
+   within a request timeout (a repeat of a version a log has is a no-op).
 6. Each log reports its durable version **to the master**. The master's committed version is
    the minimum durable version across the generation's logs. The master notifies proxies,
    which reply to their clients, and logs, which make the version visible to storage. A
@@ -79,8 +82,10 @@ unreachable one (must wait).
    master, which hands out read versions, knows it.
 7. Storage servers long-poll ("peek") their tag from a log. A log answers when the tag has
    new committed data, when a waiting read needs a newer version, or when the replica would
-   otherwise fall more than 1 ms behind. Logs only expose committed versions, so storage
-   never applies anything a recovery could discard.
+   otherwise fall more than 1 ms behind. A read that arrives before its version raises the
+   held peek's needed version with a one-way `tlogNeed`, rather than replacing the peek.
+   Logs only expose committed versions, so storage never applies anything a recovery could
+   discard.
 
 **Single-key gets** take one round trip. The client asks the master for a read version R
 and, in parallel, asks a replica for its latest applied (committed) value and version A.
@@ -138,9 +143,16 @@ pipeline, the cluster can't get stuck.
 ## Leader election
 
 Every stateless process runs a candidate. Coordinators each nominate the best recent
-candidate and keep nominating it while it heartbeats (a lease of `leaseTimeout`). A
-candidate nominated by a majority becomes controller. The leader measures its lease from
-when it **sent** each heartbeat, so its view never outlives the coordinators'. It steps
+candidate (preferring one that is heartbeating as leader, so coordinators outside the
+electing majority converge on it) and keep nominating it while it heartbeats (a lease of
+`leaseTimeout`). A
+candidate nominated by a majority then confirms with a heartbeat round, and becomes
+controller once a majority acknowledges it. (A nomination's lease runs from when the
+coordinator granted it, which may be long before the election completes; a heartbeat
+refreshes it on receipt.) The leader measures its lease from when it **sent** each
+heartbeat, so its view never outlives the coordinators', and it checks the lease before
+handling any event, so a leader that wakes from a stall past its lease steps down before
+acting. It steps
 down (halting the controller role) after `leaderStepDownTimeout` without a majority, which
 is well before any coordinator would nominate someone else. A restarted coordinator
 abstains for one lease period, since it may have nominated someone before it crashed.

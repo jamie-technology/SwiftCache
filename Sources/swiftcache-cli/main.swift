@@ -204,6 +204,8 @@ struct Bench: AsyncParsableCommand {
     @Option(help: "Fraction of reads in mixed mode.") var readRatio = 0.8
     @Option(help: "Client event-loop threads.") var threads = 4
     @Flag(help: "Write every key before measuring.") var preload = false
+    @Option(help: "Where benchmark tasks run: 'loop' (on the client's I/O threads, the fast path) or 'global' (Swift's default executor).")
+    var executor = "loop"
 
     func run() async throws {
         let db = try await Database.connect(coordinators: conn.cluster.split(separator: ",").map(String.init),
@@ -230,10 +232,12 @@ struct Bench: AsyncParsableCommand {
         }
         let pinned = try await db.readVersion()
         let start = Date()
-        let results = try await withThrowingTaskGroup(of: (Int, Int, [Double]).self) { group in
-            for _ in 0..<concurrency {
-                group.addTask {
+        let executors = executor == "loop" ? db.taskExecutors : []
+        let results = try await withThrowingTaskGroup(of: (Int, Int, [Double], [TxnSample]).self) { group in
+            for w in 0..<concurrency {
+                group.addTask(executorPreference: executors.isEmpty ? nil : executors[w % executors.count]) {
                     var ops = 0, errors = 0
+                    var samples: [TxnSample] = []
                     var latencies: [Double] = []
                     latencies.reserveCapacity(100_000)
                     let endNanos = DispatchTime.now().uptimeNanoseconds + UInt64(seconds * 1e9)
@@ -248,11 +252,13 @@ struct Bench: AsyncParsableCommand {
                             case "set": try await db.set(k, value)
                             case "txn":
                                 let k2 = "bench/\(Int.random(in: 0..<keys))"
-                                try await db.transaction { tr in
+                                let (r, report) = await db.transactionWithReport { tr in
                                     let a = try await tr.get(k) ?? value
                                     _ = try await tr.get(k2)
                                     tr.set(k2, bytes: a)
                                 }
+                                samples.append(TxnSample(ms: Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6, report: report))
+                                try r.get()
                             default:
                                 if Double.random(in: 0..<1) < readRatio { _ = try await db.get(k) } else { try await db.set(k, value) }
                             }
@@ -260,10 +266,10 @@ struct Bench: AsyncParsableCommand {
                             latencies.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
                         } catch { errors += 1 }
                     }
-                    return (ops, errors, latencies)
+                    return (ops, errors, latencies, samples)
                 }
             }
-            var all: [(Int, Int, [Double])] = []
+            var all: [(Int, Int, [Double], [TxnSample])] = []
             for try await r in group { all.append(r) }
             return all
         }
@@ -279,5 +285,35 @@ struct Bench: AsyncParsableCommand {
                          100 * Double(st.retries) / Double(max(1, st.transactions)), st.conflicts, st.tooOld, st.unknownResults,
                          st.retries - st.conflicts - st.tooOld - st.unknownResults))
         }
+        let samples = results.flatMap(\.3)
+        if !samples.isEmpty { TxnSample.summarize(samples) }
+    }
+}
+
+/// One benchmark transaction: its latency and where the time went.
+struct TxnSample {
+    var ms: Double
+    var report: Database.TransactionReport
+
+    static func summarize(_ samples: [TxnSample]) {
+        var hist: [Int: Int] = [:]
+        for s in samples { hist[min(s.report.attempts, 10), default: 0] += 1 }
+        let h = hist.keys.sorted().map { "\($0 == 10 ? "10+" : "\($0)"):\(hist[$0]!)" }.joined(separator: " ")
+        print("   attempts per txn: \(h)   max \(samples.map(\.report.attempts).max() ?? 0)")
+        let sorted = samples.sorted { $0.ms < $1.ms }
+        func line(_ label: String, _ group: ArraySlice<TxnSample>) {
+            guard !group.isEmpty else { return }
+            let n = Double(group.count)
+            func avg(_ f: (TxnSample) -> Double) -> String { String(format: "%.2f", group.map(f).reduce(0, +) / n) }
+            var reasons: [String: Int] = [:]
+            for s in group { for r in s.report.retryReasons { reasons[r.description.split(separator: ":").first.map(String.init) ?? "?", default: 0] += 1 } }
+            print("   \(label) (\(group.count) txns): latency \(avg { $0.ms })ms  attempts \(avg { Double($0.report.attempts) })"
+                  + "  backoff \(avg { Double($0.report.backoffMicros) / 1000 })ms  read-version \(avg { Double($0.report.readVersionMicros) / 1000 })ms"
+                  + "  reads \(avg { Double($0.report.readMicros) / 1000 })ms  commit \(avg { Double($0.report.commitMicros) / 1000 })ms"
+                  + (reasons.isEmpty ? "" : "  retry reasons \(reasons.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ","))"))
+        }
+        line("all      ", sorted[...])
+        line("slowest 1%", sorted.suffix(max(1, sorted.count / 100)))
+        line("slowest .1%", sorted.suffix(max(1, sorted.count / 1000)))
     }
 }

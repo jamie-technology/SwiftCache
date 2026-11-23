@@ -25,17 +25,27 @@ public final class Transaction: Sendable {
     struct State: Sendable {
         var readVersion: Version?
         var readVersionPinned = false
-        var writes: [Bytes: LocalWrite] = [:]
+        var writes: [ByteKey: LocalWrite] = [:]
         var mutations: [Mutation] = []
-        var readConflictKeys: Set<Bytes> = []
+        var readConflictKeys: Set<ByteKey> = []
         var readConflictRanges: [KeyRange] = []
-        var writeConflictKeys: Set<Bytes> = []
+        var writeConflictKeys: Set<ByteKey> = []
         var committedStamp: Versionstamp?
         var committed = false
         var idempotencyID: Bytes?
         var attemptID: UInt64 = 0
         var idempotencyRetention: UInt32 = 0
+        var timings = Timings()
+        var commitReadVersion: Version?
     }
+
+    /// Time this transaction spent waiting on the cluster (µs).
+    struct Timings: Sendable {
+        var readVersion: UInt64 = 0
+        var reads: UInt64 = 0
+        var commit: UInt64 = 0
+    }
+    var timings: Timings { state.withLock { $0.timings } }
 
     let client: ClusterClient
     let state = Mutex(State())
@@ -58,8 +68,11 @@ public final class Transaction: Sendable {
         if let v = state.withLock({ $0.readVersion }) { return v }
         // Concurrent first reads may both fetch; the first result wins so every read in
         // the transaction uses the same version.
+        let t0 = client.transport.now()
         let v = try await client.readVersion()
+        let elapsed = client.transport.now() &- t0
         return state.withLock { s in
+            s.timings.readVersion += elapsed
             if s.readVersion == nil { s.readVersion = v }
             return s.readVersion!
         }
@@ -86,13 +99,31 @@ public final class Transaction: Sendable {
     }
 
     /// The operation's idempotency record at this transaction's read version, if an
-    /// earlier attempt committed.
-    func idempotencyRecord() async throws -> (stamp: Versionstamp, attemptID: UInt64)? {
+    /// earlier attempt committed: searches the batch records of commits at versions above
+    /// `since` (the lowest read version of the attempts whose outcome is unknown) up to
+    /// this transaction's read version.
+    func idempotencyRecord(since: Version) async throws -> (stamp: Versionstamp, attemptID: UInt64)? {
         guard let id = state.withLock({ $0.idempotencyID }) else { return nil }
         let version = try await readVersion()
-        let (value, _) = try await client.read(SystemKeys.idempotency(id), at: version)
-        return value.flatMap(SystemKeys.parseIdempotencyValue)
+        guard since < version else { return nil }
+        var cursor = SystemKeys.idempotencyBatch(since &+ 1)
+        let end = SystemKeys.idempotencyBatch(version &+ 1)
+        while true {
+            let (entries, more) = try await client.readRange(KeyRange(begin: cursor, end: end), at: version, limit: 1_000)
+            for e in entries {
+                guard let v = SystemKeys.idempotencyBatchVersion(e.key),
+                      let list = SystemKeys.parseIdempotencyBatchValue(e.value) else { continue }
+                if let hit = list.first(where: { $0.id == id }) {
+                    return (Versionstamp(version: v, order: hit.order), hit.attemptID)
+                }
+            }
+            guard more, let last = entries.last else { return nil }
+            cursor = last.key.keyAfter
+        }
     }
+
+    /// The read version the last `commit()` sent (set even if its outcome is unknown).
+    var commitReadVersion: Version? { state.withLock { $0.commitReadVersion } }
 
     private func checkUserKey(_ key: Bytes) {
         precondition(!SystemKeys.isSystem(key), "keys starting with 0xFF are reserved for the system")
@@ -119,7 +150,7 @@ public final class Transaction: Sendable {
     /// versionstamp isn't known until commit).
     public func getVersioned(_ key: some CacheKey, snapshot: Bool = false) async throws -> VersionedEntry? {
         let k = key.cacheKeyBytes
-        if state.withLock({ $0.writes[k] != nil }) {
+        if state.withLock({ $0.writes[ByteKey(k)] != nil }) {
             throw SwiftCacheError.invalidRequest("getVersioned on a key written in the same transaction")
         }
         guard let (value, stamp) = try await getEntry(k, snapshot: snapshot), let value else { return nil }
@@ -129,11 +160,16 @@ public final class Transaction: Sendable {
     /// Returns (value, stamp) honoring local writes; stamp is nil for locally-written values.
     private func getEntry(_ key: Bytes, snapshot: Bool) async throws -> (value: Bytes?, stamp: Versionstamp?)? {
         try checkUsable()
-        let local = state.withLock { $0.writes[key] }
+        let local = state.withLock { $0.writes[ByteKey(key)] }
         if case .value(let v) = local { return (v, nil) }
         let version = try await readVersion()
+        let t0 = client.transport.now()
         let (value, stamp) = try await client.read(key, at: version)
-        if !snapshot { state.withLock { _ = $0.readConflictKeys.insert(key) } }
+        let elapsed = client.transport.now() &- t0
+        state.withLock {
+            $0.timings.reads += elapsed
+            if !snapshot { _ = $0.readConflictKeys.insert(ByteKey(key)) }
+        }
         if case .add(let delta) = local {
             return (LittleEndianInt64.encode(LittleEndianInt64.decode(value) &+ delta), nil)
         }
@@ -146,7 +182,7 @@ public final class Transaction: Sendable {
         let range = KeyRange(begin: begin.cacheKeyBytes, end: end.cacheKeyBytes)
         guard bytesLess(range.begin, range.end), limit > 0 else { return [] }
         let version = try await readVersion()
-        let local = state.withLock { s in s.writes.filter { range.contains($0.key) } }
+        let local = state.withLock { s in s.writes.filter { range.contains($0.key.bytes) } }
         let clears = local.values.filter { if case .value(nil) = $0 { return true } else { return false } }.count
         let (entries, more) = try await client.readRange(range, at: version, limit: limit + clears)
         // Overlay local writes.
@@ -154,7 +190,8 @@ public final class Transaction: Sendable {
         for e in entries { merged[e.key] = (e.value, e.stamp) }
         // Local writes beyond the last server key (when truncated) can't be placed safely.
         let horizon: Bytes? = more ? entries.last?.key : nil
-        for (key, w) in local {
+        for (k, w) in local {
+            let key = k.bytes
             if let h = horizon, bytesLess(h, key) { continue }
             switch w {
             case .value(let v):
@@ -189,9 +226,9 @@ public final class Transaction: Sendable {
         checkUserKey(k)
         let ttlMicros = ttl.map { UInt64(max(0, $0) * 1_000_000) } ?? 0
         state.withLock { s in
-            s.writes[k] = .value(value)
+            s.writes[ByteKey(k)] = .value(value)
             s.mutations.append(.set(key: k, value: value, ttl: ttlMicros))
-            s.writeConflictKeys.insert(k)
+            s.writeConflictKeys.insert(ByteKey(k))
         }
     }
 
@@ -205,9 +242,9 @@ public final class Transaction: Sendable {
         let k = key.cacheKeyBytes
         checkUserKey(k)
         state.withLock { s in
-            s.writes[k] = .value(nil)
+            s.writes[ByteKey(k)] = .value(nil)
             s.mutations.append(.clear(key: k))
-            s.writeConflictKeys.insert(k)
+            s.writeConflictKeys.insert(ByteKey(k))
         }
     }
 
@@ -217,16 +254,16 @@ public final class Transaction: Sendable {
         let k = key.cacheKeyBytes
         checkUserKey(k)
         state.withLock { s in
-            switch s.writes[k] {
+            switch s.writes[ByteKey(k)] {
             case .value(let v)?:
-                s.writes[k] = .value(LittleEndianInt64.encode(LittleEndianInt64.decode(v) &+ delta))
+                s.writes[ByteKey(k)] = .value(LittleEndianInt64.encode(LittleEndianInt64.decode(v) &+ delta))
             case .add(let d)?:
-                s.writes[k] = .add(d &+ delta)
+                s.writes[ByteKey(k)] = .add(d &+ delta)
             case nil:
-                s.writes[k] = .add(delta)
+                s.writes[ByteKey(k)] = .add(delta)
             }
             s.mutations.append(.add(key: k, delta: delta))
-            s.writeConflictKeys.insert(k)
+            s.writeConflictKeys.insert(ByteKey(k))
         }
     }
 
@@ -252,12 +289,12 @@ public final class Transaction: Sendable {
 
     /// Adds a read conflict on `key` as if it had been read.
     public func addReadConflict(_ key: some CacheKey) {
-        state.withLock { _ = $0.readConflictKeys.insert(key.cacheKeyBytes) }
+        state.withLock { _ = $0.readConflictKeys.insert(ByteKey(key.cacheKeyBytes)) }
     }
 
     /// Adds a write conflict on `key` as if it had been written.
     public func addWriteConflict(_ key: some CacheKey) {
-        state.withLock { _ = $0.writeConflictKeys.insert(key.cacheKeyBytes) }
+        state.withLock { _ = $0.writeConflictKeys.insert(ByteKey(key.cacheKeyBytes)) }
     }
 
     // MARK: Commit
@@ -293,13 +330,19 @@ public final class Transaction: Sendable {
         }
         let request = CommitRequest(
             readVersion: readVersion,
-            readConflictKeys: s.readConflictKeys.sorted(by: bytesLess),
+            readConflictKeys: s.readConflictKeys.map(\.bytes).sorted(by: bytesLess),
             readConflictRanges: s.readConflictRanges,
-            writeConflictKeys: s.writeConflictKeys.sorted(by: bytesLess),
+            writeConflictKeys: s.writeConflictKeys.map(\.bytes).sorted(by: bytesLess),
             mutations: s.mutations,
             idempotencyID: s.idempotencyID,
             idempotencyRetention: s.idempotencyRetention,
             attemptID: s.attemptID)
+        state.withLock { $0.commitReadVersion = readVersion }
+        let t0 = client.transport.now()
+        defer {
+            let elapsed = client.transport.now() &- t0
+            state.withLock { $0.timings.commit += elapsed }
+        }
         let stamp = try await client.commit(request)
         state.withLock {
             $0.committed = true
