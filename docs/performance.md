@@ -142,9 +142,14 @@ In k3s, these took 32-client get/set/txn from 85k/24k/10.6k to 115k/40k/17.4k op
     half the time.
   - *More read-version requests in flight per client lane* (1 → 2 or 4): no measurable
     change.
+  - *More commit batches in flight per client lane* (4 → 8 or 16), to trade the spare
+    CPU below for latency: slightly worse in k3s (32-client sets 38k → 34–36k/s,
+    transactions 17–18k → 16–17k/s, two runs each) and locally.
 - **32-client writes in k3s are latency-bound, not CPU-bound**: during a 32-client set run
   the node used 2.2 of 4 cores and no pod was saturated (master+proxy 0.47 core, each log
-  0.26). The levers there are per-hop latency and how many commit batches a client keeps
-  in flight, not CPU per message.
+  0.26). A set's p50 is 0.22 ms with one client but 0.78 ms with 32, so most of it is
+  queueing in the single-threaded master/proxy and log event loops, not network hops.
+  Next lever: less work on those loops' critical path (e.g. answering storage peeks and
+  durability reports off the push path), measured per event, not per op.
 - **Single-client latency** (get 0.07 ms vs Redis 0.015 ms) is dominated by fixed per-hop
   costs in the server event loops and the client.
