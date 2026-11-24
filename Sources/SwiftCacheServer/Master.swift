@@ -50,6 +50,12 @@ public final class MasterRole: Role {
     public private(set) var firstVersion: Version = 0
     private var minNextVersion: Version = 1
     public private(set) var committed: Version = 0
+    /// The highest committed version some batch has promised to carry to every log on its
+    /// push (the proxy's knowledge when it started the batch).
+    private var carriedCommitted: Version = 0
+    /// The highest committed version sent to the logs in a notice.
+    private var noticedCommitted: Version = 0
+    private var noticeScheduled = false
     /// Recent replies per proxy by request number: a retried request (its reply was lost)
     /// must get the *same* version, or the version chain would have a hole.
     private var replies: [UInt32: [UInt64: (prev: Version, version: Version)]] = [:]
@@ -407,6 +413,25 @@ public final class MasterRole: Role {
         context.send(.resolve(rid: rid, req), to: resolver)
     }
 
+    /// Logs expose only committed versions to storage, so they must learn each one: from
+    /// the next batch's push (which carries the proxy's committed version) when one is
+    /// coming, else from a notice. Either way a log only ever learns truly committed
+    /// versions (pushes carry what the proxy heard from us), and never later than
+    /// `committedNoticeDelay` plus the next batch's resolution.
+    private func notifyLogsUnlessCarried() {
+        guard !noticeScheduled else { return }
+        let check = { [weak self] in
+            guard let self else { return }
+            self.noticeScheduled = false
+            guard self.committed > self.noticedCommitted, self.committed > self.carriedCommitted else { return }
+            self.noticedCommitted = self.committed
+            self.context.send(.tlogCommitted(generation: self.generation, version: self.committed), toAll: self.tlogs)
+        }
+        if config.committedNoticeDelay == 0 { return check() }
+        noticeScheduled = true
+        context.schedule(after: config.committedNoticeDelay, check)
+    }
+
     public func receive(_ message: Message, from: Endpoint) {
         switch message {
         case .getCommitVersion(let rid, let proxy, let num):
@@ -414,6 +439,10 @@ public final class MasterRole: Role {
 
         case .versionAndResolve(let rid, let num, let req):
             guard req.generation == generation else { return context.send(.errorReply(rid: rid, .staleGeneration), to: from) }
+            // Every allocated version is pushed to every log (or the generation ends: logs
+            // append in version order, and the proxy re-pushes until committed), carrying
+            // at least this committed version.
+            carriedCommitted = max(carriedCommitted, req.knownCommitted)
             allocate(rid: rid, proxy: req.proxyIndex, num: num, from: from, resolve: req)
 
         case .reportCommitted(let rid, let version):
@@ -427,7 +456,7 @@ public final class MasterRole: Role {
             // Everything up to minDurable is on every log of the generation: committed.
             committed = minDurable
             for p in proxies { context.send(.committedVersion(generation: generation, version: committed), to: p) }
-            for t in tlogs { context.send(.tlogCommitted(generation: generation, version: committed), to: t) }
+            notifyLogsUnlessCarried()
 
         case .getReadVersion(let rid):
             // Every commit acknowledged to any client is ≤ committed (proxies reply only

@@ -45,7 +45,7 @@ struct SimCommand: ParsableCommand {
             runs += 1
             let r = runSimulation(seed: s, options: options)
             var line = "seed \(s): \(r.passed ? "PASS" : "FAIL") trace=\(String(r.traceHash, radix: 16)) msgs=\(r.messages)"
-            let interesting = ["recoveries", "bank.commits", "cycle.commits", "cas.success", "add.commits", "orders.commits", "history.commits", "history.historicalReads"]
+            let interesting = ["recoveries", "bank.commits", "cycle.commits", "cas.success", "add.commits", "orders.commits", "history.commits", "history.historicalReads", "history.pipelines", "realtime.checks"]
             line += " " + interesting.map { "\($0)=\(r.stats[$0] ?? 0)" }.joined(separator: " ")
             if checkDeterminism {
                 let again = runSimulation(seed: s, options: options)

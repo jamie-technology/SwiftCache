@@ -187,7 +187,10 @@ public final class TLogRole: Role {
         }
         // Success isn't acknowledged to the proxy: durability goes to the master, whose
         // committed version completes the commit. Only refusals are answered.
-        if push.entry.version <= durable { return }  // a retransmission of something we have
+        if push.entry.version <= durable {
+            // A retransmission of something we have; its committed version may be news.
+            return advanceKnownCommitted(push.knownCommitted)
+        }
         pendingPushes[push.prevVersion] = (from, rid, push)
         var appended = false
         while let next = pendingPushes.removeValue(forKey: durable) {

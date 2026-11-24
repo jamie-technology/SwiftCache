@@ -56,15 +56,15 @@ run() {
 
 for CONCURRENCY in $CONCURRENCY_LEVELS; do
 if [[ "${REDIS:-1}" == 1 ]]; then
-echo "== Redis 7, $CONCURRENCY clients (redis-benchmark -d $VALUE_SIZE -r $KEYS, no pipelining)"
-N=$((CONCURRENCY * 3000))
-run redis:7.4-alpine redis-benchmark -h redis -c "$CONCURRENCY" -n "$N" -d "$VALUE_SIZE" -r "$KEYS" -t set,get --csv \
+echo "== Redis 7, $CONCURRENCY clients (redis-benchmark -d $VALUE_SIZE -r $KEYS, pipeline ${PIPELINE:-1})"
+N=$((CONCURRENCY * 3000 * ${PIPELINE:-1}))
+run redis:7.4-alpine redis-benchmark -h redis -c "$CONCURRENCY" -n "$N" -d "$VALUE_SIZE" -r "$KEYS" -P "${PIPELINE:-1}" -t set,get --csv \
   | tr -d '"' | awk -F, 'NR==1{next} {printf "%s: %.0f ops/s  p50=%sms p99=%sms max=%sms\n", tolower($1), $2, $5, $7, $8}'
 fi
 
 echo "== SwiftCache, $CONCURRENCY clients (same value size and key space)"
 for mode in $MODES; do
   run "$IMAGE" swiftcache-cli bench --mode "$mode" --concurrency "$CONCURRENCY" --value-size "$VALUE_SIZE" \
-    --keys "$KEYS" --seconds "$SECONDS_PER_TEST" --threads "${THREADS:-1}"
+    --keys "$KEYS" --seconds "$SECONDS_PER_TEST" --threads "${THREADS:-1}" --pipeline "${PIPELINE:-1}"
 done
 done

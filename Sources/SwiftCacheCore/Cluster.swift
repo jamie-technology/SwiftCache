@@ -471,18 +471,23 @@ public struct ResolveRequest: Hashable, Sendable, WireCodable {
     /// Where the resolver sends its reply (the proxy, when the master forwarded the
     /// request; empty = reply to the sender).
     public var replyTo: Endpoint
+    /// The committed version the proxy knew when it started this batch. The batch's push
+    /// carries at least this to every log, so the master needn't notify the logs of it.
+    public var knownCommitted: Version
     public init(generation: UInt64, proxyIndex: UInt32, version: Version, prevVersion: Version, lastSeenVersion: Version,
-                txns: [ResolveTxn], metaOps: [MetaOp], replyTo: Endpoint = "") {
+                txns: [ResolveTxn], metaOps: [MetaOp], replyTo: Endpoint = "", knownCommitted: Version = 0) {
         self.generation = generation; self.proxyIndex = proxyIndex; self.version = version; self.prevVersion = prevVersion
         self.lastSeenVersion = lastSeenVersion; self.txns = txns; self.metaOps = metaOps; self.replyTo = replyTo
+        self.knownCommitted = knownCommitted
     }
     public func encode(to w: inout WireWriter) {
         w.u64(generation); w.u32(proxyIndex); w.u64(version); w.u64(prevVersion); w.u64(lastSeenVersion); w.put(txns); w.put(metaOps)
-        w.string(replyTo)
+        w.string(replyTo); w.u64(knownCommitted)
     }
     public init(from r: inout WireReader) throws {
         generation = try r.u64(); proxyIndex = try r.u32(); version = try r.u64(); prevVersion = try r.u64()
         lastSeenVersion = try r.u64(); txns = try r.getArray(); metaOps = try r.getArray(); replyTo = try r.string()
+        knownCommitted = try r.u64()
     }
 }
 

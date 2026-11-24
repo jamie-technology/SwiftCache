@@ -48,6 +48,44 @@ or a shard moves. `Database` is `Sendable`; create one per process and share it.
 The single-key conveniences (`set`, `clear`, `add`, `compareAndSwap`, `compareAndDelete`)
 are idempotent.
 
+## Pipelines
+
+Like a Redis pipeline: many single-key operations in one call, with far fewer round trips
+and task switches than issuing them one at a time.
+
+```swift
+let results = try await db.pipeline { p in
+    try p.set("user/42/name", "Ada")
+    p.add("user/42/logins", 1)
+    p.get("user/42/name")       // sees the set above
+    p.get("user/42/logins")
+}
+let name = try results[2].value(as: String.self)        // "Ada"
+let logins = LittleEndianInt64.decode(results[3].bytes)  // includes this pipeline's add
+let stamp = results[0].versionstamp                       // the write run's commit
+```
+
+Semantics (stronger than Redis's):
+
+- **In order.** Each operation sees the effects of every earlier operation in the
+  pipeline: a `get` after a `set` of the same key returns the new value.
+- **Write runs are atomic and exactly-once.** Consecutive writes (`set`, `clear`, `add`)
+  commit together as one idempotent transaction (up to 1,000 per commit), so they are
+  applied exactly once even if a commit's outcome was unknown and had to be retried. All
+  writes of a run share the run's versionstamp.
+- **Read runs are one snapshot.** Consecutive `get`s are served at one read version,
+  requested after everything earlier in the pipeline committed: they see every commit
+  acknowledged before the run started, all at the same version.
+- If a call throws, earlier write runs may have committed (each exactly once); later ones
+  did not run.
+
+Results come back in operation order as `PipelineResult`: `.read(VersionedEntry?)` for
+gets, `.written(Versionstamp)` for writes. You can also build a `Pipeline` value and run
+it with `db.execute(_:)`.
+
+`swiftcache-cli bench --mode get|set --pipeline 16` measures it (`PIPELINE=16
+scripts/bench-vs-redis.sh` runs `redis-benchmark -P 16` alongside).
+
 ## `Transaction`
 
 | Method | Description |

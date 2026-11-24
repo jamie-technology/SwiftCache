@@ -204,13 +204,14 @@ struct Bench: AsyncParsableCommand {
     @Option(help: "Fraction of reads in mixed mode.") var readRatio = 0.8
     @Option(help: "Client event-loop threads.") var threads = 4
     @Flag(help: "Write every key before measuring.") var preload = false
+    @Option(help: "Operations per pipeline for get/set (like redis-benchmark -P); 1 = no pipelining.") var pipeline = 1
     @Option(help: "Where benchmark tasks run: 'loop' (on the client's I/O threads, the fast path) or 'global' (Swift's default executor).")
     var executor = "loop"
 
     func run() async throws {
         let db = try await Database.connect(coordinators: conn.cluster.split(separator: ",").map(String.init),
                                             threads: threads)
-        let keys = self.keys, mode = self.mode, readRatio = self.readRatio
+        let keys = self.keys, mode = self.mode, readRatio = self.readRatio, depth = max(1, self.pipeline)
         let value = Bytes(repeating: UInt8(ascii: "x"), count: valueSize)
         if preload || mode == "get" || mode == "read-at" {
             try await withThrowingTaskGroup(of: Void.self) { g in
@@ -245,6 +246,17 @@ struct Bench: AsyncParsableCommand {
                         let k = "bench/\(Int.random(in: 0..<keys))"
                         let t0 = DispatchTime.now().uptimeNanoseconds
                         do {
+                            if depth > 1, mode == "get" || mode == "set" {
+                                var p = Pipeline()
+                                for _ in 0..<depth {
+                                    let key = "bench/\(Int.random(in: 0..<keys))"
+                                    if mode == "get" { p.get(key) } else { p.set(key, bytes: value) }
+                                }
+                                _ = try await db.execute(p)
+                                ops += depth
+                                latencies.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+                                continue
+                            }
                             switch mode {
                             case "grv": _ = try await db.createTransaction().readVersion()
                             case "read-at": _ = try await db.read(atVersion: pinned) { try await $0.get(k) }

@@ -502,7 +502,12 @@ func realtimeReader(_ sim: Simulator, _ db: Database, _ counters: Counters, unti
         round += 1
         let acked = counters["rt.acked"]
         do {
-            switch round % 3 {
+            switch round % 4 {
+            case 3:
+                // A pipelined read started after the ack must see it too.
+                let r = try await db.pipeline { $0.get("rt/c") }
+                let v = try r[0].value(as: Int.self) ?? 0
+                if v < acked { sim.fail("realtime: pipelined get saw rt/c=\(v) after \(acked) was acknowledged") }
             case 0:
                 let v = try await db.transaction { tr in try await tr.get("rt/c", as: Int.self) ?? 0 }
                 if v < acked { sim.fail("realtime: read-only transaction saw rt/c=\(v) after \(acked) was acknowledged") }
@@ -534,6 +539,9 @@ func historyWorkload(_ sim: Simulator, _ db: Database, _ counters: Counters, cli
     var written: [(value: Int, stamp: Versionstamp)] = []
     var lastStamp = Versionstamp.zero
     var i = 0
+    // Pipelines whose outcome we know (acknowledged) or don't (failed: their add may or
+    // may not have been applied, exactly once at most).
+    var pipesAcked: Int64 = 0, pipesFailed: Int64 = 0
     while sim.now < end {
         do {
             i += 1
@@ -599,6 +607,41 @@ func historyWorkload(_ sim: Simulator, _ db: Database, _ counters: Counters, cli
                 }
             }
             if written.count > 50 { written.removeFirst(written.count - 50) }
+
+            // Pipelines: effects in order, a write run is one atomic commit, adds apply
+            // exactly once.
+            let pk = "pipe/\(client)"
+            let r: [PipelineResult]
+            do {
+                r = try await db.pipeline { p in
+                    try p.set("\(pk)/a", value)
+                    p.add("\(pk)/n", 1)
+                    p.get("\(pk)/a")
+                    p.get("\(pk)/n")
+                    try p.set("\(pk)/a", value + 1_000_000)
+                    p.get("\(pk)/a")
+                }
+            } catch {
+                pipesFailed += 1
+                throw error
+            }
+            pipesAcked += 1
+            counters.inc("history.pipelines")
+            guard r.count == 6, let s0 = r[0].versionstamp, let s4 = r[4].versionstamp else {
+                sim.fail("pipeline: malformed results \(r)"); continue
+            }
+            if r[1].versionstamp != s0 { sim.fail("pipeline: one write run committed as two (\(s0) vs \(String(describing: r[1].versionstamp)))") }
+            if try r[2].value(as: Int.self) != value || r[2].versionstamp != s0 {
+                sim.fail("pipeline: get after set saw \(String(describing: r[2].entry)), want \(value) at \(s0)")
+            }
+            let n = LittleEndianInt64.decode(r[3].bytes)
+            if n < pipesAcked || n > pipesAcked + pipesFailed {
+                sim.fail("pipeline: counter \(n) outside [\(pipesAcked), \(pipesAcked + pipesFailed)] (exactly-once adds)")
+            }
+            if s4 <= s0 { sim.fail("pipeline: later write run \(s4) not after \(s0)") }
+            if try r[5].value(as: Int.self) != value + 1_000_000 || r[5].versionstamp != s4 {
+                sim.fail("pipeline: final get saw \(String(describing: r[5].entry)), want \(value + 1_000_000) at \(s4)")
+            }
         } catch {
             handle(sim, counters, "history", error)
         }

@@ -86,7 +86,7 @@ import Testing
                                              metaOps: [.transfer(moveID: 1, slots: SlotSet([3]), from: 0, to: 1)])),
             .resolveReply(rid: 18, ResolveReply(version: 10, prevVersion: 9, verdicts: [0, 1, 2], stateOps: [StateOps(version: 9, ops: [.removeShard(shard: 4)])])),
             .versionAndResolve(rid: 25, requestNum: 3, ResolveRequest(generation: 2, proxyIndex: 1, version: 0, prevVersion: 0, lastSeenVersion: 8,
-                                                                      txns: [], metaOps: [], replyTo: "p:1#proxy-1")),
+                                                                      txns: [], metaOps: [], replyTo: "p:1#proxy-1", knownCommitted: 7)),
             .readBatch(rid: 26, items: [ReadItem(key: [1], version: 5), ReadItem(key: [2, 3], version: 6)]),
             .readBatchReply(rid: 27, results: [.value([9], Versionstamp(version: 5, order: 1)), .value(nil, .zero), .error(.wrongShard)]),
             .commitBatch(rid: 28, [CommitRequest(readVersion: 3, mutations: [.add(key: [1], delta: 2)])]),

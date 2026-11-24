@@ -31,6 +31,8 @@ struct Server: ParsableCommand {
     @Option(help: "Commit proxies per generation.") var proxies: Int = 2
     @Option(help: "Commit batches a proxy keeps in flight (pushed, not yet durable).") var maxInflightBatches: Int?
     @Option(help: "MVCC window in seconds (how far back reads are served).") var mvccWindow: Double = 10
+    @Option(help: "Microseconds the master waits for a commit batch to carry a new committed version to the logs before notifying them itself (0 = notify at once).")
+    var committedNoticeDelay: UInt64?
     @Option(help: "Seconds without a registration before a process is considered dead.") var failureTimeout: Double = 3
     @Option(help: "Seconds the last replica of a shard may be gone before its data is given up.") var shardLossTimeout: Double = 120
     @Option(help: "Log level: debug, info, warning, error.") var logLevel: String = "info"
@@ -44,6 +46,7 @@ struct Server: ParsableCommand {
         config.logReplicas = logs
         config.commitProxies = proxies
         if let maxInflightBatches { config.maxInflightBatches = max(1, maxInflightBatches) }
+        if let committedNoticeDelay { config.committedNoticeDelay = committedNoticeDelay }
         config.mvccWindow = UInt64(mvccWindow * 1_000_000)
         config.failureTimeout = UInt64(failureTimeout * 1_000_000)
         config.shardLossTimeout = UInt64(shardLossTimeout * 1_000_000)

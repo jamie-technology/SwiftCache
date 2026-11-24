@@ -77,9 +77,14 @@ unreachable one (must wait).
    within a request timeout (a repeat of a version a log has is a no-op).
 6. Each log reports its durable version **to the master**. The master's committed version is
    the minimum durable version across the generation's logs. The master notifies proxies,
-   which reply to their clients, and logs, which make the version visible to storage. A
-   client is therefore only told "committed" once every log has the commit **and** the
-   master, which hands out read versions, knows it.
+   which reply to their clients. A client is therefore only told "committed" once every
+   log has the commit **and** the master, which hands out read versions, knows it.
+   Logs make a version visible to storage only once they know it's committed. They learn
+   that from the next batch's push, which carries the proxy's committed version. Each
+   batch tells the master which committed version its push will carry, and the master
+   sends the logs a separate notice only if no batch has promised the new version within
+   `committedNoticeDelay` (50 µs), i.e. at low load. Either way a log only ever learns
+   genuinely committed versions.
 7. Storage servers subscribe to ("peek") their tag on a log. The subscription streams: the
    log sends a reply (same request id) whenever the tag has new committed data, a waiting
    read needs a newer version, or the replica would otherwise fall more than 1 ms behind,

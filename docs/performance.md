@@ -15,6 +15,19 @@ Redis, `swiftcache-cli bench` for SwiftCache.
 | set | 163k ops/s, p50 0.10 ms | 54k, p50 0.56 ms | 159k, p50 0.78 ms | 122k, p50 1.68 ms |
 | 2-key read-modify-write txn | — | 22.6k, p50 1.31 ms | — | 61k, p50 3.6 ms, p99.9 27 ms |
 
+**Pipelined** (`PIPELINE=16`: `redis-benchmark -P 16` vs `Database.pipeline` with 16
+operations; SwiftCache commits each pipeline's sets as one replicated, idempotent
+transaction and reads each pipeline's gets from one snapshot):
+
+| | Redis 7, 1 / 32 / 256 clients | SwiftCache, 1 / 32 / 256 clients |
+| --- | --- | --- |
+| get | 261k / 1.48M / 1.62M | 59k / 535k / 826k |
+| set | 522k / 1.42M / 979k | 64k / 302k / 313k |
+
+Pipelining multiplies SwiftCache's single-client set rate by 13 (5k → 64k/s) and its
+32-client sets by 5. Redis gains more, since its per-command cost once the round trip is
+shared is a few hundred nanoseconds, against a replicated commit here.
+
 One client: Redis 36k gets/s and 48k sets/s (p50 0.015 ms) in this run (25–38k and
 22–86k in others: Redis's single-client numbers swing widely on this VM); SwiftCache 13k
 gets/s (p50 0.07 ms), 4.3k sets/s (p50 0.22 ms), 1.9k transactions/s (p50 0.51 ms).
@@ -155,6 +168,9 @@ transactions, because it started a new batch as soon as the previous one was res
 | One encoding per push | A batch's push is identical for every log; it is encoded once and the bytes shared by each log's frame | ~6% of master/proxy CPU at 256 clients |
 
 | Client replies flushed first; byte-level endpoint parsing | A `perf` profile of the master in k3s (Linux) showed ~40% of its CPU inside `write`: on the bridged pod network the receiver's TCP path, netfilter included, runs in the sender's syscall (~9 µs per flush). The end-of-pass flush went through connections in dictionary order, so a commit's client reply often waited behind the master's three log notices. Client connections are now flushed first. Endpoint parsing (`processAddress`, the `client:` test) used `Character` search, running grapheme breaking on every message (4.5% of the master); it now searches bytes | k3s, back to back (2 rounds): 1-client set 4.9k → 5.3k/s (p50 0.20 → 0.17 ms), 32-client gets 132k → 146k, 32-client sets 58k → 61k |
+
+| Commit notices ride on pushes | The master told every log of every new committed version (one message per log per batch). Pushes already carry the proxy's committed version, so the master now sends a notice only if no batch has promised to carry the new version within 50 µs (each batch's resolve request says what its push will carry) | k3s, 32-client sets: each log's CPU −16% (231–244m → 193–203m), master −1% (its notices already shared a flush with the pushes); 1-client sets +5%; throughput unchanged (nothing was CPU-bound) |
+| Pipelining API | `Database.pipeline`: ordered single-key operations; a run of writes is one idempotent atomic commit, a run of reads one snapshot read with one suspension | 1-client sets 5k → 64k/s, 32-client sets 61k → 302k/s at depth 16 (see the pipelined table above) |
 
 Measured, then: in-flight cap 1 vs 2 vs 4 vs 8 (32 clients, local): sets 66.9k / 67.7k /
 62.1k / 59.5k, server µs per set 34.7 / 44.3 / 50.2 / 51.4.

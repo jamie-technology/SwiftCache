@@ -318,6 +318,39 @@ final class ClusterClient: Sendable {
         throw lastError
     }
 
+    /// Reads every key at `version`, resuming once: each read goes to a replica of its
+    /// key's shard through that replica's batcher, so N keys cost ~one batch per replica.
+    /// Keys whose fast read fails (moved shard, lagging replica, ...) are retried one by
+    /// one with `read(_:at:)`'s failover.
+    func readMany(_ keys: [Bytes], at version: Version) async throws -> [(Bytes?, Versionstamp)] {
+        guard !keys.isEmpty else { return [] }
+        let topo = try await topology()
+        let results: [ReadResult?] = await withUnsafeContinuation { cont in
+            let join = ManyJoin(count: keys.count, cont)
+            for (i, key) in keys.enumerated() {
+                guard let shard = topo.shard(forKey: key), !shard.replicas.isEmpty else {
+                    join.set(i, nil)
+                    continue
+                }
+                let replica = shard.replicas[Int(transport.random(UInt64(shard.replicas.count)))]
+                readCoalescer(replica).submit(ReadItem(key: key, version: version)) { result in
+                    join.set(i, try? result.get())
+                }
+            }
+        }
+        var out: [(Bytes?, Versionstamp)] = []
+        out.reserveCapacity(keys.count)
+        for (i, r) in results.enumerated() {
+            switch r {
+            case .value(let value, let stamp)?, .valueAt(let value, let stamp, _)?:
+                out.append((value, stamp))
+            default:
+                out.append(try await read(keys[i], at: version))
+            }
+        }
+        return out
+    }
+
     typealias LatestValue = (value: Bytes?, stamp: Versionstamp, version: Version)
 
     /// Asks a replica of `key`'s shard for the latest value it has applied (with that
@@ -480,6 +513,30 @@ final class LatestJoin: Sendable {
             guard s.haveLatest else { return nil }
             let out: Output = (latest: s.latest, version: result)
             return out
+        }
+        if let done { cont.resume(returning: done) }
+    }
+}
+
+/// Collects `count` callback results by index and resumes the caller once, when all are in.
+final class ManyJoin: Sendable {
+    private struct State {
+        var results: [ReadResult?]
+        var remaining: Int
+    }
+    private let state: Mutex<State>
+    private let cont: UnsafeContinuation<[ReadResult?], Never>
+
+    init(count: Int, _ cont: UnsafeContinuation<[ReadResult?], Never>) {
+        state = Mutex(State(results: Array(repeating: nil, count: count), remaining: count))
+        self.cont = cont
+    }
+
+    func set(_ index: Int, _ result: ReadResult?) {
+        let done = state.withLock { s -> [ReadResult?]? in
+            s.results[index] = result
+            s.remaining -= 1
+            return s.remaining == 0 ? s.results : nil
         }
         if let done { cont.resume(returning: done) }
     }

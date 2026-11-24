@@ -261,7 +261,8 @@ public final class CommitProxy: Role {
                               readRanges: p.request.readConflictRanges, writeKeys: writeKeys)
         }
         let req = ResolveRequest(generation: spec.generation, proxyIndex: spec.index, version: 0, prevVersion: 0,
-                                 lastSeenVersion: map.version, txns: txns, metaOps: b.meta.flatMap(\.request.metaOps))
+                                 lastSeenVersion: map.version, txns: txns, metaOps: b.meta.flatMap(\.request.metaOps),
+                                 knownCommitted: knownCommitted)
         sendVersionAndResolve(b, req)
     }
 

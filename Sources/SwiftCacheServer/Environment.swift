@@ -94,6 +94,11 @@ public struct ClusterConfig: Sendable, Hashable {
     /// A replica with no new data still advances at least this often (versions ≈ µs), so
     /// "latest" reads on idle shards are rarely behind the read version.
     public var replicaFreshness: UInt64 = 1_000
+    /// How long the master waits, after the committed version advances, for a commit batch
+    /// to promise to carry it to the logs on its push before notifying the logs itself.
+    /// Under load the next batch starts within microseconds, so the notices (3 messages per
+    /// batch) are skipped; at idle they go out after this delay. 0 = always notify at once.
+    public var committedNoticeDelay: UInt64 = 50
     public var peekTimeout: UInt64 = 200_000
     public var popInterval: UInt64 = 100_000
     public var snapshotTimeout: UInt64 = 5_000_000
