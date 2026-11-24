@@ -234,10 +234,9 @@ public final class Database: Sendable {
                 // commit acknowledged before this call, observed before the call returns.
                 // Otherwise (a lagging replica) read at R.
                 let topology = try await client.topology()
-                let latest = ResultBox<ClusterClient.LatestValue?>()
-                client.readLatest(k, topology: topology, into: latest)
-                let version = try await client.readVersion()
-                if let l = await latest.value, l.version >= version {
+                let (latest, versionResult) = await client.latestAndReadVersion(k, topology: topology)
+                let version = try versionResult.get()
+                if let l = latest, l.version >= version {
                     return l.value.map { VersionedEntry(key: k, bytes: $0, versionstamp: l.stamp) }
                 }
                 let (value, stamp) = try await client.read(k, at: version)

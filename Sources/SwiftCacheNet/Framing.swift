@@ -21,6 +21,8 @@ public struct Frame: Sendable {
     public var message: Message
     /// Set by the decoder when `from` was first seen on this connection in this frame.
     public var fromIsNew = false
+    /// `message`, already encoded (shared by frames carrying the same message).
+    var encodedMessage: Bytes?
     public init(from: Endpoint, to: Endpoint, message: Message) { self.from = from; self.to = to; self.message = message }
 }
 
@@ -52,7 +54,7 @@ final class FrameEncoder: ChannelOutboundHandler {
         w.u32(0)  // length placeholder
         reference(frame.from, &w)
         reference(frame.to, &w)
-        frame.message.encode(to: &w)
+        if let body = frame.encodedMessage { w.raw(body) } else { frame.message.encode(to: &w) }
         var buf = context.channel.allocator.buffer(capacity: w.bytes.count)
         buf.writeBytes(w.bytes)
         buf.setInteger(UInt32(w.bytes.count - 4), at: buf.readerIndex)

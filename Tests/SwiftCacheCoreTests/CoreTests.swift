@@ -197,3 +197,113 @@ import Testing
         #expect(r.resolve(CommitRequest(readVersion: 7), commitVersion: 13) == .tooOld)
     }
 }
+
+@Suite struct VersionTableTests {
+    /// Deterministic generator for reproducible random workloads.
+    struct Gen { var s: UInt64; mutating func next() -> UInt64 { s &+= 0x9E37_79B9_7F4A_7C15; var z = s; z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9; z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB; return z ^ (z >> 31) } }
+
+    @Test func matchesDictionaryModel() {
+        var g = Gen(s: 42)
+        var t = VersionTable(capacity: 16)
+        var model: [UInt64: Version] = [:]
+        // Small key universe (with clustered hashes, incl. 0) forces long probe runs,
+        // wrap-around and many backward shifts; phases grow then shrink the table.
+        for phase in 0..<6 {
+            let universe: UInt64 = phase % 2 == 0 ? 5_000 : 300
+            for _ in 0..<40_000 {
+                let r = g.next()
+                let k = (r % universe) &* (phase < 3 ? 1 : 0x1_0000_0000)  // phase 3+: low bits all 0 → same home slot runs
+                let key = k == 1 ? 0 : k
+                let norm = key == 0 ? 1 : key
+                if r >> 62 == 0 {
+                    let v = Version(g.next() % 4)
+                    t.remove(key, ifVersion: v)
+                    if model[norm] == v { model[norm] = nil }
+                } else if phase >= 2 && r >> 61 == 2 {
+                    // Remove with the exact version (drains the table).
+                    if let v = model[norm] { t.remove(key, ifVersion: v); model[norm] = nil }
+                } else {
+                    let v = Version(g.next() % 4)
+                    t.set(key, v)
+                    model[norm] = v
+                }
+                #expect(t.get(key) == model[norm])
+            }
+            #expect(t.count == model.count)
+            for (k, v) in model { #expect(t.get(k) == v) }
+        }
+        for (k, v) in model { t.remove(k, ifVersion: v) }
+        #expect(t.count == 0)
+        #expect(t.capacity <= 1024 || t.capacity == 16)
+    }
+
+    @Test func hashSeparatesKeys() {
+        var seen = Set<UInt64>()
+        for i in 0..<200_000 { seen.insert(hash64(Bytes("key/\(i)".utf8), seed: 7)) }
+        #expect(seen.count == 200_000)
+        #expect(hash64(Bytes("a".utf8), seed: 1) != hash64(Bytes("a".utf8), seed: 2))
+        #expect(hash64([], seed: 1) != hash64([0], seed: 1))
+        #expect(hash64([1, 0], seed: 1) != hash64([1], seed: 1))
+    }
+
+    /// The original exact-key conflict set, as a reference model.
+    struct ReferenceConflicts {
+        var lastWrite: [Bytes: Version] = [:]
+        var recent: [(Version, [Bytes])] = []
+        var oldest: Version = 0
+        mutating func resolve(_ r: CommitRequest, at v: Version) -> ConflictSet.Outcome {
+            if r.readVersion < oldest { return .tooOld }
+            for k in r.readConflictKeys { if let w = lastWrite[k], w > r.readVersion { return .conflict } }
+            for (cv, keys) in recent.reversed() where cv > r.readVersion {
+                for range in r.readConflictRanges where keys.contains(where: { !bytesLess($0, range.begin) && bytesLess($0, range.end) }) { return .conflict }
+            }
+            guard !r.writeConflictKeys.isEmpty else { return .commit }
+            for k in r.writeConflictKeys { lastWrite[k] = v }
+            recent.append((v, r.writeConflictKeys))
+            return .commit
+        }
+        mutating func advance(_ o: Version) {
+            guard o > oldest else { return }
+            oldest = o
+            while let f = recent.first, f.0 < o {
+                recent.removeFirst()
+                for k in f.1 where lastWrite[k] == f.0 { lastWrite[k] = nil }
+            }
+        }
+    }
+
+    @Test func conflictSetMatchesExactKeyReference() {
+        var g = Gen(s: 7)
+        var fast = ConflictSet()
+        fast.reset(rejectingReadsBefore: 0, seed: 12345)
+        var ref = ReferenceConflicts()
+        func key() -> Bytes { Bytes("k\(g.next() % 300)".utf8) }
+        var version: Version = 100
+        var outcomes = [ConflictSet.Outcome: Int]()
+        for _ in 0..<60_000 {
+            version += 1 + g.next() % 3
+            if g.next() % 50 == 0 {
+                let o = version > 40 ? version - 40 + g.next() % 10 : 0
+                fast.advance(oldest: o)
+                ref.advance(o)
+            }
+            let rv = version - 1 - g.next() % 50
+            var reads: [Bytes] = []
+            for _ in 0..<(g.next() % 3) { reads.append(key()) }
+            var ranges: [KeyRange] = []
+            if g.next() % 8 == 0 { let a = key(); ranges.append(KeyRange(begin: a, end: a + [0xff])) }
+            var writes = Set<Bytes>()
+            for _ in 0..<(g.next() % 4) { writes.insert(key()) }
+            if g.next() % 2 == 0 { writes.insert(Bytes([0xff]) + Bytes("idmp/\(g.next())".utf8)) }
+            let req = CommitRequest(readVersion: rv, readConflictKeys: reads, readConflictRanges: ranges,
+                                    writeConflictKeys: writes.sorted(by: bytesLess), mutations: [])
+            let a = fast.resolve(req, commitVersion: version)
+            let b = ref.resolve(req, at: version)
+            #expect(a == b)
+            if a != b { return }
+            outcomes[a, default: 0] += 1
+        }
+        // The workload exercises every outcome.
+        #expect(outcomes[.commit, default: 0] > 1000 && outcomes[.conflict, default: 0] > 1000 && outcomes[.tooOld, default: 0] > 100)
+    }
+}

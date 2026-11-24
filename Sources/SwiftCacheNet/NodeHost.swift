@@ -120,10 +120,27 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
         UInt64(Date().timeIntervalSince1970 * 1_000_000)
     }
 
+    public func send(_ message: Message, from: Endpoint, toAll: [Endpoint]) {
+        guard toAll.count > 1 else { return toAll.forEach { send(message, from: from, to: $0) } }
+        // Encode the message once; each connection's frame reuses the bytes.
+        var w = WireWriter(capacity: 256)
+        message.encode(to: &w)
+        let body = w.bytes
+        for to in toAll { send(message, from: from, to: to, encoded: body) }
+    }
+
     public func send(_ message: Message, from: Endpoint, to: Endpoint) {
+        send(message, from: from, to: to, encoded: nil)
+    }
+
+    private func send(_ message: Message, from: Endpoint, to: Endpoint, encoded: Bytes?) {
         loop.preconditionInEventLoop()
         if to.hasPrefix("client:") {
-            if let ch = clientChannels[to.processAddress] { write(Frame(from: from, to: to, message: message), to: ch) }
+            if let ch = clientChannels[to.processAddress] {
+                var frame = Frame(from: from, to: to, message: message)
+                frame.encodedMessage = encoded
+                write(frame, to: ch)
+            }
             return
         }
         let dest = to.processAddress
@@ -132,7 +149,8 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
             loop.execute { [self] in self.process?.receive(message, from: from, to: to) }
             return
         }
-        let frame = Frame(from: from, to: to, message: message)
+        var frame = Frame(from: from, to: to, message: message)
+        frame.encodedMessage = encoded
         switch outbound[dest] {
         case .ready(let ch)?:
             write(frame, to: ch)

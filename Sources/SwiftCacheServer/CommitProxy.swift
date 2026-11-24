@@ -388,7 +388,7 @@ public final class CommitProxy: Role {
     private func sendPushes(_ b: BatchState, _ push: TLogPush) {
         b.push = push
         b.pushedAt = context.now
-        for t in spec.tlogs { context.send(.tlogPush(rid: 0, push), to: t) }
+        context.send(.tlogPush(rid: 0, push), toAll: spec.tlogs)
     }
 
     /// Re-pushes batches the master hasn't declared committed within a request timeout

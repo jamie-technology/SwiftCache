@@ -7,15 +7,20 @@ import SwiftCacheCore
 /// read set (point keys or ranges). Transactions in one batch are resolved in order, so a
 /// transaction also conflicts with earlier transactions of the same batch.
 struct ConflictSet {
-    /// Last committed write version of each key written within the MVCC window.
-    private var lastWrite: [ByteKey: Version] = [:]
+    /// Last committed write version within the MVCC window, by seeded 64-bit key hash.
+    /// Invariant: the entry for hash h is at least the newest write version of every key
+    /// hashing to h, and is expired only when the write that set it leaves the window. So
+    /// a read never misses a conflict; a collision can only cause a spurious conflict (an
+    /// abort and retry, which is always safe), with probability ~ entries / 2^64.
+    private var lastWrite = VersionTable()
+    private var seed: UInt64 = 0x243F_6A88_85A3_08D3
     /// Recent commits (version, sorted written keys), oldest first; used for range checks.
     private var recent = Deque<(version: Version, keys: [Bytes])>()
     /// Reads older than this are rejected (window edge or recovery point).
     private(set) var oldestReadable: Version = 0
     private var lastSweep: Version = 0
 
-    enum Outcome: Equatable {
+    enum Outcome: Hashable {
         case commit
         case conflict
         case tooOld
@@ -31,7 +36,7 @@ struct ConflictSet {
     mutating func resolve(_ req: ResolveTxn, commitVersion: Version) -> Outcome {
         if req.readVersion < oldestReadable { return .tooOld }
         for key in req.readKeys {
-            if let w = lastWrite[ByteKey(key)], w > req.readVersion { return .conflict }
+            if let w = lastWrite.get(hash64(key, seed: seed)), w > req.readVersion { return .conflict }
         }
         if !req.readRanges.isEmpty {
             // Walk commits newer than the read version (newest first).
@@ -48,8 +53,12 @@ struct ConflictSet {
 
     private mutating func record(_ keys: [Bytes], at version: Version) {
         guard !keys.isEmpty else { return }
-        for key in keys { lastWrite[ByteKey(key)] = version }
-        recent.append((version, keys.sorted(by: bytesLess)))
+        for key in keys { lastWrite.set(hash64(key, seed: seed), version) }
+        // Usually already sorted (clients sort; the idempotency key is a system key, which
+        // sorts last), so check before sorting.
+        var sorted = true
+        for i in keys.indices.dropFirst() where !bytesLess(keys[i - 1], keys[i]) { sorted = false; break }
+        recent.append((version, sorted ? keys : keys.sorted(by: bytesLess)))
     }
 
     /// Whether any key of the sorted array falls in `range`.
@@ -70,16 +79,14 @@ struct ConflictSet {
         // write that last set it leaves the window.
         while let first = recent.first, first.version < oldest {
             recent.removeFirst()
-            for key in first.keys {
-                let k = ByteKey(key)
-                if let i = lastWrite.index(forKey: k), lastWrite.values[i] == first.version { lastWrite.remove(at: i) }
-            }
+            for key in first.keys { lastWrite.remove(hash64(key, seed: seed), ifVersion: first.version) }
         }
     }
 
     /// Forgets all history; reads older than `version` are rejected (coordinator recovery).
-    mutating func reset(rejectingReadsBefore version: Version) {
-        lastWrite = [:]
+    mutating func reset(rejectingReadsBefore version: Version, seed: UInt64? = nil) {
+        if let seed { self.seed = seed }
+        lastWrite.removeAll()
         recent = Deque()
         oldestReadable = version
         lastSweep = version
@@ -112,7 +119,7 @@ public final class ResolverRole: Role {
 
     public func start() {
         // History before this generation is unknown: older read versions can't be checked.
-        conflicts.reset(rejectingReadsBefore: spec.startVersion)
+        conflicts.reset(rejectingReadsBefore: spec.startVersion, seed: context.random(.max))
         context.ready()
     }
 

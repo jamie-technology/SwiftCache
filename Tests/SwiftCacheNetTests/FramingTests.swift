@@ -49,6 +49,23 @@ import Testing
         #expect(fresh.first?.fromIsNew == true && fresh.first?.to == b)
     }
 
+    @Test func preEncodedMessagesAreIdentical() throws {
+        let m = Message.tlogPop(tag: 9, version: 99)
+        var w = WireWriter()
+        m.encode(to: &w)
+        var shared = Frame(from: "a:1#x", to: "b:2#y", message: .tlogPop(tag: 0, version: 0))
+        shared.encodedMessage = w.bytes  // the bytes, not `message`, go on the wire
+        let plain = Frame(from: "a:1#x", to: "b:2#y", message: m)
+        let ch1 = try loopback(), ch2 = try loopback()
+        try ch1.writeOutbound(shared)
+        try ch2.writeOutbound(plain)
+        let b1 = try #require(try ch1.readOutbound(as: ByteBuffer.self))
+        let b2 = try #require(try ch2.readOutbound(as: ByteBuffer.self))
+        #expect(b1 == b2)
+        try ch1.writeInbound(b1)
+        #expect(try ch1.readInbound(as: Frame.self)?.message == m)
+    }
+
     @Test func fallsBackToLiteralsWhenFull() throws {
         let capacity = 8
         let ch = try loopback(capacity: capacity)

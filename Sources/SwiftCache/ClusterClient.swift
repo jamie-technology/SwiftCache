@@ -320,16 +320,24 @@ final class ClusterClient: Sendable {
 
     typealias LatestValue = (value: Bytes?, stamp: Versionstamp, version: Version)
 
-    /// Reads the latest value a replica of `key`'s shard has applied, with that version,
-    /// into `box` (nil if the replica can't answer; the caller then falls back to a
-    /// versioned read). Callback-based so it can run alongside a read-version request
-    /// without a child task.
-    func readLatest(_ key: Bytes, topology topo: Topology, into box: ResultBox<LatestValue?>) {
-        guard let shard = topo.shard(forKey: key), !shard.replicas.isEmpty else { return box.set(nil) }
-        let replica = shard.replicas[Int(transport.random(UInt64(shard.replicas.count)))]
-        readCoalescer(replica).submit(ReadItem(key: key, version: 0)) { result in
-            guard case .success(.valueAt(let v, let s, let ver)) = result else { return box.set(nil) }
-            box.set((v, s, ver))
+    /// Asks a replica of `key`'s shard for the latest value it has applied (with that
+    /// version) and, after that, for a read version; resumes once, when both have
+    /// answered. The replica's answer is nil if it can't give one (the caller then falls
+    /// back to a versioned read). The read version is requested after the call started,
+    /// as strictness requires.
+    func latestAndReadVersion(_ key: Bytes, topology topo: Topology) async -> (latest: LatestValue?, version: Result<Version, any Error>) {
+        await withUnsafeContinuation { cont in
+            let join = LatestJoin(cont)
+            if let shard = topo.shard(forKey: key), !shard.replicas.isEmpty {
+                let replica = shard.replicas[Int(transport.random(UInt64(shard.replicas.count)))]
+                readCoalescer(replica).submit(ReadItem(key: key, version: 0)) { result in
+                    guard case .success(.valueAt(let v, let s, let ver)) = result else { return join.latest(nil) }
+                    join.latest((v, s, ver))
+                }
+            } else {
+                join.latest(nil)
+            }
+            lane.grv.submit(0) { join.version($0) }
         }
     }
 
@@ -438,5 +446,41 @@ final class ClusterClient: Sendable {
             }
         }
         throw lastError
+    }
+}
+
+/// Joins a get's two concurrent answers (a replica's latest value and a read version) so
+/// the caller suspends and resumes once. Not generic: no per-get metadata lookups.
+final class LatestJoin: Sendable {
+    typealias Output = (latest: ClusterClient.LatestValue?, version: Result<Version, any Error>)
+    private struct State {
+        var latest: ClusterClient.LatestValue?
+        var haveLatest = false
+        var version: Result<Version, any Error>?
+    }
+    private let state = Mutex(State())
+    private let cont: UnsafeContinuation<Output, Never>
+
+    init(_ cont: UnsafeContinuation<Output, Never>) { self.cont = cont }
+
+    func latest(_ value: ClusterClient.LatestValue?) {
+        let done = state.withLock { s -> Output? in
+            s.latest = value
+            s.haveLatest = true
+            guard let v = s.version else { return nil }
+            let out: Output = (latest: value, version: v)
+            return out
+        }
+        if let done { cont.resume(returning: done) }
+    }
+
+    func version(_ result: Result<Version, any Error>) {
+        let done = state.withLock { s -> Output? in
+            s.version = result
+            guard s.haveLatest else { return nil }
+            let out: Output = (latest: s.latest, version: result)
+            return out
+        }
+        if let done { cont.resume(returning: done) }
     }
 }

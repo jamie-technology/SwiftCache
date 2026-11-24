@@ -6,6 +6,8 @@ public struct WireWriter: Sendable {
     public init(capacity: Int = 64) { bytes.reserveCapacity(capacity) }
 
     public mutating func u8(_ v: UInt8) { bytes.append(v) }
+    /// Appends already-encoded bytes verbatim.
+    public mutating func raw(_ v: Bytes) { bytes.append(contentsOf: v) }
     public mutating func bool(_ v: Bool) { bytes.append(v ? 1 : 0) }
     public mutating func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { bytes.append(contentsOf: $0) } }
     public mutating func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { bytes.append(contentsOf: $0) } }

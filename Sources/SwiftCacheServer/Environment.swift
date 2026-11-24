@@ -25,9 +25,17 @@ public protocol ProcessEnvironment: AnyObject {
     var versionClock: UInt64 { get }
     var disk: any Disk { get }
     func send(_ message: Message, from: Endpoint, to: Endpoint)
+    /// Sends the same message to several endpoints (a runtime may encode it once).
+    func send(_ message: Message, from: Endpoint, toAll: [Endpoint])
     func schedule(after micros: UInt64, _ action: @escaping () -> Void)
     func random(_ upperBound: UInt64) -> UInt64
     func log(_ level: LogLevel, _ message: @autoclosure () -> String)
+}
+
+extension ProcessEnvironment {
+    public func send(_ message: Message, from: Endpoint, toAll: [Endpoint]) {
+        for to in toAll { send(message, from: from, to: to) }
+    }
 }
 
 /// A process as seen by its runtime: it receives every message addressed to any of its
@@ -139,6 +147,12 @@ public final class RoleContext {
     public func send(_ message: Message, to: Endpoint) {
         guard !stopped else { return }
         env.send(message, from: endpoint, to: to)
+    }
+
+    /// Sends the same message to each of `toAll`, in order (encoded once where possible).
+    public func send(_ message: Message, toAll: [Endpoint]) {
+        guard !stopped else { return }
+        env.send(message, from: endpoint, toAll: toAll)
     }
 
     public func schedule(after micros: UInt64, _ action: @escaping () -> Void) {

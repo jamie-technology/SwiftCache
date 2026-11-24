@@ -11,13 +11,13 @@ Redis, `swiftcache-cli bench` for SwiftCache.
 
 | | Redis 7, 32 clients | SwiftCache, 32 | Redis 7, 256 clients | SwiftCache, 256 |
 | --- | --- | --- | --- | --- |
-| get | 174k ops/s, p50 0.10 ms | 110k, p50 0.26 ms | 164k, p50 0.78 ms | **290k**, p50 0.76 ms |
-| set | 154k ops/s, p50 0.10 ms | 44k, p50 0.68 ms | 163k, p50 0.77 ms | 111k, p50 1.92 ms |
-| 2-key read-modify-write txn | — | 19.8k, p50 1.50 ms | — | 55k, p50 4.1 ms, p99.9 31 ms |
+| get | 172k ops/s, p50 0.10 ms | 120k, p50 0.26 ms | 163k, p50 0.78 ms | **384k**, p50 0.57 ms |
+| set | 163k ops/s, p50 0.10 ms | 54k, p50 0.56 ms | 159k, p50 0.78 ms | 122k, p50 1.68 ms |
+| 2-key read-modify-write txn | — | 22.6k, p50 1.31 ms | — | 61k, p50 3.6 ms, p99.9 27 ms |
 
-One client: Redis 25k gets/s and 22k sets/s (p50 0.023 / 0.047 ms) in this run (38k / 86k
-in an earlier one: Redis's single-client numbers swing widely on this VM); SwiftCache 13k
-gets/s (p50 0.07 ms), 4.7k sets/s (p50 0.20 ms), 2.0k transactions/s (p50 0.48 ms).
+One client: Redis 36k gets/s and 48k sets/s (p50 0.015 ms) in this run (25–38k and
+22–86k in others: Redis's single-client numbers swing widely on this VM); SwiftCache 13k
+gets/s (p50 0.07 ms), 4.3k sets/s (p50 0.22 ms), 1.9k transactions/s (p50 0.51 ms).
 
 Streaming delivery, A/B on the same quiet machine, back to back (`main` 3237be7 → streaming):
 set 4.3k → 4.7k (1 client), 36k → 44k (32), 107k → 111k (256); txn 18.5k → 19.8k (32),
@@ -149,6 +149,10 @@ transactions, because it started a new batch as soon as the previous one was res
 | One commit batch in flight per proxy (`maxInflightBatches` 8 → 1) | While logs and master work on a batch, arrivals accumulate into the next, so messages and syscalls per transaction drop. A scheduling change only: batch contents and ordering are unchanged | local, 32 clients: server CPU per set 51 → 35 µs, sets +12%, txns +14% (CPU per txn 137 → 109 µs); 256 clients: sets 170k → 199k/s; k3s: neutral (batches there were already 20–70 transactions, since each hop takes 200–400 µs) |
 | One commit batch and one read batch in flight per client lane (was 4 each) | Same effect on the client side: requests accumulate while a batch is out, so batches are larger and messages fewer. With the proxy holding one batch, extra client slots only queued at the proxy | k3s, 32 clients: sets 45.9k → 52.6k/s (+15%, p50 0.65 → 0.57 ms; commits per batch 5 → 16, batch round trip 483 → 302 µs); 256 clients: gets 276k → 303–314k (+12%), txns 57k → 61k; single-client unchanged (one request is never held back); mixed 80% reads at 32 clients: 51k → 68k ops/s, p50 0.56 → 0.42 ms |
 | Per-connection endpoint interning | Frames named `from`/`to` with 30–60-byte strings, decoded into new heap strings each time; now each endpoint is defined once per connection and referenced by a 2-byte number | ~70 fewer bytes per frame. No measurable CPU or throughput change (locally or in k3s); kept for multi-node networks, where bytes per message matter at 100k+ ops/s |
+
+| One suspension per get | A get awaited its read version and its replica answer separately (two task suspensions and resumptions, and a generic `ResultBox` instantiated per call); now a non-generic join resumes the caller once, when both answers are in | 32 concurrent gets on one client thread: 131k → 160k/s, client CPU 7.5 → 6.1 µs/get (in k3s the single-threaded benchmark client was the get bottleneck at 986m) |
+| Resolver keyed by 64-bit key hashes in a flat table | Every idempotent operation adds a unique conflict key (its idempotency record) for the 10 s window: ~1.4M heap-allocated byte keys, SipHashed on insert, lookup and expiry. Now a seeded 64-bit hash in an open-addressing table (16 bytes/entry). A collision can only cause a spurious conflict (abort and retry), never a missed one: an entry holds at least the newest write of every key with its hash, and expires only with the write that set it. Range checks still use exact keys | resolver 29% → 11% of the master/proxy process at 256 clients; master/proxy memory 255 → 207 MB; sets at 256 clients 144k → 155k/s |
+| One encoding per push | A batch's push is identical for every log; it is encoded once and the bytes shared by each log's frame | ~6% of master/proxy CPU at 256 clients |
 
 Measured, then: in-flight cap 1 vs 2 vs 4 vs 8 (32 clients, local): sets 66.9k / 67.7k /
 62.1k / 59.5k, server µs per set 34.7 / 44.3 / 50.2 / 51.4.
