@@ -135,7 +135,7 @@ final class ClusterClient: Sendable {
         lane.commits.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 4, now: { transport.now() }) { reqs, done in
+            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 1, now: { transport.now() }) { reqs, done in
                 transport.send(to: endpoint, timeout: timeout, { .commitBatch(rid: $0, reqs) }) { result in
                     switch result {
                     case .success(.commitBatchReply(_, let results)) where results.count == reqs.count:
@@ -159,7 +159,7 @@ final class ClusterClient: Sendable {
         lane.reads.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 4, now: { transport.now() }) { items, done in
+            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 1, now: { transport.now() }) { items, done in
                 transport.send(to: endpoint, timeout: timeout, { .readBatch(rid: $0, items: items) }) { result in
                     switch result {
                     case .success(.readBatchReply(_, let results)) where results.count == items.count:

@@ -147,6 +147,7 @@ transactions, because it started a new batch as soon as the previous one was res
 | Change | Why it helped | Effect |
 | --- | --- | --- |
 | One commit batch in flight per proxy (`maxInflightBatches` 8 → 1) | While logs and master work on a batch, arrivals accumulate into the next, so messages and syscalls per transaction drop. A scheduling change only: batch contents and ordering are unchanged | local, 32 clients: server CPU per set 51 → 35 µs, sets +12%, txns +14% (CPU per txn 137 → 109 µs); 256 clients: sets 170k → 199k/s; k3s: neutral (batches there were already 20–70 transactions, since each hop takes 200–400 µs) |
+| One commit batch and one read batch in flight per client lane (was 4 each) | Same effect on the client side: requests accumulate while a batch is out, so batches are larger and messages fewer. With the proxy holding one batch, extra client slots only queued at the proxy | k3s, 32 clients: sets 45.9k → 52.6k/s (+15%, p50 0.65 → 0.57 ms; commits per batch 5 → 16, batch round trip 483 → 302 µs); 256 clients: gets 276k → 303–314k (+12%), txns 57k → 61k; single-client unchanged (one request is never held back); mixed 80% reads at 32 clients: 51k → 68k ops/s, p50 0.56 → 0.42 ms |
 | Per-connection endpoint interning | Frames named `from`/`to` with 30–60-byte strings, decoded into new heap strings each time; now each endpoint is defined once per connection and referenced by a 2-byte number | ~70 fewer bytes per frame. No measurable CPU or throughput change (locally or in k3s); kept for multi-node networks, where bytes per message matter at 100k+ ops/s |
 
 Measured, then: in-flight cap 1 vs 2 vs 4 vs 8 (32 clients, local): sets 66.9k / 67.7k /
@@ -177,7 +178,8 @@ each mode on a freshly started cluster, or let it settle, before comparing.
     change.
   - *More commit batches in flight per client lane* (4 → 8 or 16), to trade the spare
     CPU below for latency: slightly worse in k3s (32-client sets 38k → 34–36k/s,
-    transactions 17–18k → 16–17k/s, two runs each) and locally.
+    transactions 17–18k → 16–17k/s, two runs each) and locally. Fewer turned out better
+    (Performance V: 4 → 1, +15% sets).
 - **32-client writes in k3s are latency-bound, not CPU-bound**: during a 32-client set run
   the node used 2.2 of 4 cores and no pod was saturated (master+proxy 0.47 core, each log
   0.26). A set's p50 is 0.22 ms with one client but 0.78 ms with 32, so most of it is
