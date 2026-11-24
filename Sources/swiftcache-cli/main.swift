@@ -279,6 +279,8 @@ struct Bench: AsyncParsableCommand {
         func pct(_ p: Double) -> String { lat.isEmpty ? "-" : String(format: "%.2f", lat[min(lat.count - 1, Int(Double(lat.count) * p))]) }
         print("\(mode): " + String(format: "%.0f ops/s", Double(ops) / elapsed)
               + "  p50=\(pct(0.5))ms p99=\(pct(0.99))ms p99.9=\(pct(0.999))ms  errors=\(errors)")
+        let batching = db.batchingSummary
+        if !batching.isEmpty { print("   client batching: \(batching)") }
         let st = db.statistics
         if st.retries > 0 {
             print(String(format: "   retries: %.1f%% of transactions (conflicts %d, too old %d, unknown %d, other %d)",

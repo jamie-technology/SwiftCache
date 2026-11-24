@@ -31,6 +31,19 @@ public final class Database: Sendable {
         public var unknownResults: Int
     }
 
+    /// Client-side batching: per operation, how long requests waited to be sent and how
+    /// long a batch's round trip took (µs, averages since this handle was created).
+    public var batchingSummary: String {
+        let (c, r) = client.batchingStats
+        func line(_ name: String, items: Int, batches: Int, queued: UInt64, rtt: UInt64) -> String {
+            guard batches > 0 else { return "" }
+            return "\(name): \(items / batches) per batch, queued \(queued / UInt64(max(1, items))) µs, round trip \(rtt / UInt64(batches)) µs"
+        }
+        return [line("commits", items: c.items, batches: c.batches, queued: c.queued, rtt: c.roundTrip),
+                line("reads", items: r.items, batches: r.batches, queued: r.queued, rtt: r.roundTrip)]
+            .filter { !$0.isEmpty }.joined(separator: "; ")
+    }
+
     public var statistics: Statistics {
         Statistics(transactions: counters.transactions.load(ordering: .relaxed), retries: counters.retries.load(ordering: .relaxed),
                    conflicts: counters.conflicts.load(ordering: .relaxed), tooOld: counters.tooOld.load(ordering: .relaxed),

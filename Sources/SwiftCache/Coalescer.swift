@@ -9,34 +9,50 @@ import Synchronization
 /// safe for read versions (strict serializability) as well as for reads.
 final class Coalescer<Item: Sendable, Output: Sendable>: Sendable {
     typealias Completion = @Sendable (Result<Output, any Error>) -> Void
-    typealias Batch = [(item: Item, done: Completion)]
+    typealias Batch = [(item: Item, done: Completion, at: UInt64)]
+
+    /// Where batched requests spent their time (µs), since creation.
+    struct Stats: Sendable {
+        var items = 0
+        var batches = 0
+        /// Summed over items: from submit until its batch was sent.
+        var queued: UInt64 = 0
+        /// Summed over batches: from send until the reply.
+        var roundTrip: UInt64 = 0
+    }
 
     private struct State {
         var inFlight = 0
         var queue: Batch = []
+        var stats = Stats()
     }
     private let state = Mutex(State())
     private let maxBatch: Int
     private let maxInFlight: Int
+    private let now: @Sendable () -> UInt64
     /// Sends a batch and calls back with one result per item, in order. The callback
     /// must not run before `send` returns.
     private let send: @Sendable ([Item], @escaping @Sendable ([Result<Output, any Error>]) -> Void) -> Void
 
-    init(maxBatch: Int = 256, maxInFlight: Int = 1,
+    init(maxBatch: Int = 256, maxInFlight: Int = 1, now: @escaping @Sendable () -> UInt64 = { 0 },
          send: @escaping @Sendable ([Item], @escaping @Sendable ([Result<Output, any Error>]) -> Void) -> Void) {
+        self.now = now
         self.maxBatch = max(1, maxBatch)
         self.maxInFlight = max(1, maxInFlight)
         self.send = send
     }
 
+    var stats: Stats { state.withLock { $0.stats } }
+
     func submit(_ item: Item, _ done: @escaping Completion) {
+        let t = now()
         let batch = state.withLock { s -> Batch? in
             guard s.inFlight < maxInFlight else {
-                s.queue.append((item, done))
+                s.queue.append((item, done, t))
                 return nil
             }
             s.inFlight += 1
-            return [(item, done)]
+            return [(item, done, t)]
         }
         if let batch { dispatch(batch) }
     }
@@ -48,9 +64,17 @@ final class Coalescer<Item: Sendable, Output: Sendable>: Sendable {
     }
 
     private func dispatch(_ batch: Batch) {
+        let sentAt = now()
+        state.withLock { s in
+            s.stats.batches += 1
+            s.stats.items += batch.count
+            for b in batch { s.stats.queued += sentAt &- b.at }
+        }
         send(batch.map(\.item)) { [self] results in
+            let rtt = now() &- sentAt
             // Send whatever queued meanwhile before delivering results: it's waiting.
             let next = state.withLock { s -> Batch? in
+                s.stats.roundTrip += rtt
                 if s.queue.isEmpty {
                     s.inFlight -= 1
                     return nil

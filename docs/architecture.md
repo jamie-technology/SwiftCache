@@ -80,9 +80,12 @@ unreachable one (must wait).
    which reply to their clients, and logs, which make the version visible to storage. A
    client is therefore only told "committed" once every log has the commit **and** the
    master, which hands out read versions, knows it.
-7. Storage servers long-poll ("peek") their tag from a log. A log answers when the tag has
-   new committed data, when a waiting read needs a newer version, or when the replica would
-   otherwise fall more than 1 ms behind. A read that arrives before its version raises the
+7. Storage servers subscribe to ("peek") their tag on a log. The subscription streams: the
+   log sends a reply (same request id) whenever the tag has new committed data, a waiting
+   read needs a newer version, or the replica would otherwise fall more than 1 ms behind,
+   and a heartbeat at least every `peekTimeout`. Each reply carries the version it
+   continues from; a storage server applies only a contiguous continuation of what it has,
+   and resubscribes after a gap (a lost reply) or silence. A read that arrives before its version raises the
    held peek's needed version with a one-way `tlogNeed`, rather than replacing the peek.
    Logs only expose committed versions, so storage never applies anything a recovery could
    discard.
