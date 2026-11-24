@@ -30,6 +30,10 @@ public final class StorageServer: Role {
     private var peekNeed: Version = 0
     /// The log the in-flight peek went to.
     private var peekTarget: Endpoint?
+    /// The current subscription's request id and tag (0 = none), and its last reply.
+    private var streamRID: UInt64 = 0
+    private var streamTag: Tag = 0
+    private var lastStreamAt: UInt64 = 0
     private var peekCursor = 0
     private var lastPopped: Version = 0
     private var tagRetired = Set<Tag>()
@@ -170,6 +174,10 @@ public final class StorageServer: Role {
         pullIfNeeded()
     }
 
+    /// Subscribes to our tag on one log. The log streams replies (same rid) as committed
+    /// data arrives, plus a heartbeat at least every `peekTimeout`, until we resubscribe,
+    /// unsubscribe, or it stops (locked by a recovery). One message per delivery instead
+    /// of a reply and a new peek.
     private func pullIfNeeded() {
         guard tag != 0, !peekInFlight, !dbInfo.tlogs.isEmpty else { return }
         peekInFlight = true
@@ -181,37 +189,67 @@ public final class StorageServer: Role {
         let after = applied
         let need = neededVersion > applied ? neededVersion : 0
         peekNeed = need
+        var rid: UInt64 = 0
         context.request(to: tlog, timeout: config.peekTimeout + config.requestTimeout, {
-            .tlogPeek(rid: $0, tag: myTag, from: after, upTo: 0, need: need)
+            rid = $0
+            return .tlogPeek(rid: $0, tag: myTag, from: after, upTo: 0, need: need)
         }) { [weak self] reply in
-            guard let self else { return }
-            guard seq == self.peekSeq else {
-                // Superseded by a peek with a higher need: keep any data, don't re-loop.
-                if case .tlogPeekReply(_, let p)? = reply, p.status == .ok, self.tag == myTag { self.applyPeek(p) }
-                return
-            }
-            self.peekInFlight = false
-            guard self.tag == myTag else { return self.pullIfNeeded() }
-            switch reply {
-            case .tlogPeekReply(_, let p)?:
-                switch p.status {
-                case .ok:
-                    self.applyPeek(p)
-                    self.pullIfNeeded()
-                case .tooOld:
-                    self.wipe("log no longer has versions after \(after) for tag \(myTag)")
-                case .tagRemoved:
-                    self.wipe("tag \(myTag) was retired")
-                case .stopped:
-                    // That log was locked by a recovery; wait for the new generation's logs.
-                    self.peekCursor += 1
-                    self.context.schedule(after: 100_000) { self.pullIfNeeded() }
-                }
-            default:
-                self.peekCursor += 1
-                self.context.schedule(after: 20_000) { self.pullIfNeeded() }
-            }
+            guard let self, seq == self.peekSeq else { return }  // replaced by a newer subscription
+            guard let reply else { return self.streamFailed() }
+            self.streamReply(reply, tag: myTag)
         }
+        streamRID = rid
+        streamTag = myTag
+        lastStreamAt = context.now
+    }
+
+    /// A reply of the current subscription (the first arrives through the request, the
+    /// rest through `receive`).
+    private func streamReply(_ reply: Message, tag myTag: Tag) {
+        lastStreamAt = context.now
+        guard tag == myTag else {
+            endStream()
+            return pullIfNeeded()
+        }
+        guard case .tlogPeekReply(_, let p) = reply else { return streamFailed() }
+        switch p.status {
+        case .ok:
+            // Apply only a contiguous continuation of what we have: if a reply was lost
+            // (broken connection), resubscribe from where we are.
+            guard p.begin <= applied else {
+                endStream()
+                return pullIfNeeded()
+            }
+            applyPeek(p)
+        case .tooOld:
+            endStream()
+            wipe("log no longer has versions after \(p.begin) for tag \(myTag)")
+        case .tagRemoved:
+            endStream()
+            wipe("tag \(myTag) was retired")
+        case .stopped:
+            // That log was locked by a recovery; wait for the new generation's logs.
+            endStream()
+            peekCursor += 1
+            context.schedule(after: 100_000) { [weak self] in self?.pullIfNeeded() }
+        }
+    }
+
+    /// Ends the current subscription (telling the log, in case it's still streaming).
+    private func endStream() {
+        if peekInFlight, streamRID != 0, let t = peekTarget {
+            context.send(.tlogUnsubscribe(rid: streamRID, tag: streamTag), to: t)
+        }
+        peekInFlight = false
+        streamRID = 0
+        peekSeq += 1  // a pending first reply is now stale
+    }
+
+    /// The log stopped answering: try the next one.
+    private func streamFailed() {
+        endStream()
+        peekCursor += 1
+        context.schedule(after: 20_000) { [weak self] in self?.pullIfNeeded() }
     }
 
     private func applyPeek(_ p: PeekReply) {
@@ -237,6 +275,10 @@ public final class StorageServer: Role {
     }
 
     private func housekeeping() {
+        // A live subscription heartbeats every peekTimeout: silence means it's gone.
+        if peekInFlight, streamRID != 0, context.now &- lastStreamAt > config.peekTimeout + config.requestTimeout {
+            streamFailed()
+        }
         // Release applied data on every log.
         if tag != 0, applied > lastPopped {
             lastPopped = applied
@@ -410,6 +452,15 @@ public final class StorageServer: Role {
 
     public func receive(_ message: Message, from: Endpoint) {
         switch message {
+        case .tlogPeekReply(let rid, _):
+            if rid != 0, rid == streamRID, from == peekTarget {
+                streamReply(message, tag: streamTag)
+            } else {
+                // A stream we no longer want (we resubscribed elsewhere): stop it.
+                context.send(.tlogUnsubscribe(rid: rid, tag: streamTag), to: from)
+            }
+        case .errorReply(let rid, _) where rid != 0 && rid == streamRID && from == peekTarget:
+            streamFailed()
         case .read(let rid, let key, let version):
             handleRead(rid: rid, key: key, version: version, from: from)
         case .readBatch(let rid, let items):

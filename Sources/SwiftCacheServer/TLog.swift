@@ -44,6 +44,8 @@ public final class TLogRole: Role {
         var after: Version
         var need: Version
         var id: UInt64
+        /// When this subscription last got a reply (heartbeats keep consumers' watchdogs quiet).
+        var lastSent: UInt64
     }
     /// Per tag, the versions that carry data for it (ascending, trimmed on pop): lets a
     /// held peek be answered only when its tag actually has something new.
@@ -69,6 +71,7 @@ public final class TLogRole: Role {
     public var dataFloor: Version? { popped.filter { $0.key != metadataTag }.values.min() }
 
     public func start() {
+        context.every(config.peekTimeout / 4) { [weak self] in self?.heartbeatSubscriptions() }
         durable = spec.startVersion
         knownCommitted = spec.startVersion
         popped[metadataTag] = 0
@@ -113,12 +116,14 @@ public final class TLogRole: Role {
         case .tlogPush(let rid, let push):
             handlePush(rid: rid, push: push, from: from)
         case .tlogPeek(let rid, let tag, let after, let upTo, let need):
-            // A consumer has at most one held peek per tag: answer a superseded one now.
-            if let i = peekWaiters.firstIndex(where: { $0.from == from && $0.tag == tag }) {
-                let old = peekWaiters.remove(at: i)
-                context.send(.tlogPeekReply(rid: old.rid, PeekReply(status: .ok, entries: [], end: old.after)), to: old.from)
-            }
+            // A peek is a subscription: replies keep streaming (same rid) until the consumer
+            // peeks again, unsubscribes, or the stream ends. A consumer has one per tag: a
+            // new peek replaces its old subscription.
+            peekWaiters.removeAll { $0.from == from && $0.tag == tag }
             handlePeek(rid: rid, tag: tag, after: after, upTo: upTo, need: need, from: from, waiterID: nil)
+        case .tlogUnsubscribe(let rid, _):
+            // Request ids are unique per consumer role, so (from, rid) names one stream.
+            peekWaiters.removeAll { $0.from == from && $0.rid == rid }
         case .tlogNeed(let tag, let need):
             // Raise the need of this consumer's held peek; if it was already answered the
             // note is moot (the consumer's next peek carries its needs).
@@ -284,15 +289,17 @@ public final class TLogRole: Role {
 
     private func handlePeek(rid: UInt64, tag: Tag, after requested: Version, upTo: Version, need: Version, from: Endpoint, waiterID: UInt64?) {
         guard ready else {
-            context.send(.tlogPeekReply(rid: rid, PeekReply(status: .stopped, entries: [], end: requested)), to: from)
+            context.send(.tlogPeekReply(rid: rid, PeekReply(status: .stopped, entries: [], end: requested, begin: requested)), to: from)
             return
         }
         guard let tagPopped = popped[tag] else {
             context.send(.tlogPeekReply(rid: rid, PeekReply(status: .tagRemoved, entries: [], end: requested)), to: from)
             return
         }
-        // A brand-new consumer (after = 0) starts at the tag's beginning.
+        // A brand-new consumer (after = 0) starts at the tag's beginning: for it, the stream
+        // continues from 0 (it has everything before the tag existed, i.e. nothing).
         let after = requested == 0 ? tagPopped : requested
+        let begin = requested
         if after < tagPopped {
             context.send(.tlogPeekReply(rid: rid, PeekReply(status: .tooOld, entries: [], end: requested)), to: from)
             return
@@ -302,23 +309,18 @@ public final class TLogRole: Role {
         // has become available, or the caller asked for a fixed range.
         let answerable = upTo > 0 || locked || need == .max || (need > after && limit >= need)
             || limit >= after &+ config.replicaFreshness || hasData(tag, after: after, through: limit)
+        let id = waiterID ?? { nextWaiterID += 1; return nextWaiterID }()
         if limit <= after || !answerable {
-            if locked || upTo > 0 || need == .max {
-                context.send(.tlogPeekReply(rid: rid, PeekReply(status: locked ? .stopped : .ok, entries: [], end: after)), to: from)
+            if locked {
+                context.send(.tlogPeekReply(rid: rid, PeekReply(status: .stopped, entries: [], end: after, begin: after)), to: from)
                 return
             }
-            // Long poll: answer when something new is committed, or after peekTimeout.
-            let id = waiterID ?? { nextWaiterID += 1; return nextWaiterID }()
-            peekWaiters.append(PeekWaiter(from: from, rid: rid, tag: tag, after: after, need: need, id: id))
-            if waiterID == nil {
-                context.schedule(after: config.peekTimeout) { [weak self] in
-                    guard let self, let i = self.peekWaiters.firstIndex(where: { $0.id == id }) else { return }
-                    let w = self.peekWaiters.remove(at: i)
-                    // Answer with whatever is committed (a full scan: the reply's content
-                    // never depends on the tag index, only its timing does).
-                    self.handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, need: .max, from: w.from, waiterID: w.id)
-                }
+            if upTo > 0 || need == .max {
+                respond(rid: rid, tag: tag, after: after, begin: begin, upTo: upTo, need: need, from: from, id: id, entries: [], end: after)
+                return
             }
+            // Hold: answered when something new is committed, or by the heartbeat sweep.
+            peekWaiters.append(PeekWaiter(from: from, rid: rid, tag: tag, after: after, need: need, id: id, lastSent: context.now))
             return
         }
         var out: [PeekEntry] = []
@@ -348,7 +350,29 @@ public final class TLogRole: Role {
             }
             i += 1
         }
-        context.send(.tlogPeekReply(rid: rid, PeekReply(status: .ok, entries: out, end: end)), to: from)
+        respond(rid: rid, tag: tag, after: after, begin: begin, upTo: upTo, need: need, from: from, id: id, entries: out, end: end)
+    }
+
+    /// Sends an ok peek reply covering (after, end] and, for a streaming peek, keeps the
+    /// subscription going from `end`.
+    private func respond(rid: UInt64, tag: Tag, after: Version, begin: Version, upTo: Version, need: Version, from: Endpoint, id: UInt64,
+                         entries out: [PeekEntry], end: Version) {
+        context.send(.tlogPeekReply(rid: rid, PeekReply(status: .ok, entries: out, end: end, begin: begin)), to: from)
+        guard upTo == 0, !locked else { return }
+        peekWaiters.append(PeekWaiter(from: from, rid: rid, tag: tag, after: max(after, end),
+                                      need: need == .max ? 0 : need, id: id, lastSent: context.now))
+    }
+
+    /// Answers subscriptions that have had no reply for `peekTimeout` (an empty reply if
+    /// nothing is committed for them), so consumers can tell a live stream from a dead one.
+    private func heartbeatSubscriptions() {
+        let now = context.now
+        guard peekWaiters.contains(where: { now &- $0.lastSent >= config.peekTimeout }) else { return }
+        let due = peekWaiters.filter { now &- $0.lastSent >= config.peekTimeout }
+        peekWaiters.removeAll { now &- $0.lastSent >= config.peekTimeout }
+        // Answer with whatever is committed (a full scan: the reply's content never depends
+        // on the tag index, only its timing does).
+        for w in due { handlePeek(rid: w.rid, tag: w.tag, after: w.after, upTo: 0, need: .max, from: w.from, waiterID: w.id) }
     }
 
     private func wakePeekWaiters() {

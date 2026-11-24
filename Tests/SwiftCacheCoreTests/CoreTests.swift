@@ -92,7 +92,7 @@ import Testing
             .commitBatch(rid: 28, [CommitRequest(readVersion: 3, mutations: [.add(key: [1], delta: 2)])]),
             .commitBatchReply(rid: 29, [.committed(Versionstamp(version: 7, order: 0)), .failed(.notCommitted)]),
             .tlogDurable(generation: 2, version: 10), .committedVersion(generation: 2, version: 10),
-            .tlogCommitted(generation: 2, version: 10), .tlogNeed(tag: 3, need: 11), .tlogLease(rid: 30, generation: 2),
+            .tlogCommitted(generation: 2, version: 10), .tlogNeed(tag: 3, need: 11), .tlogUnsubscribe(rid: 4, tag: 3), .tlogLease(rid: 30, generation: 2),
             .tlogPeek(rid: 31, tag: 4, from: 5, upTo: 0, need: 9),
             .tlogPush(rid: 19, TLogPush(generation: 2, prevVersion: 9, entry: entry, knownCommitted: 8)),
             .tlogPeekReply(rid: 20, PeekReply(status: .ok, entries: [PeekEntry(version: 10, mutations: [(0, .clear(key: [1]))], meta: [])], end: 10)),

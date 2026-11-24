@@ -69,6 +69,10 @@ single thread doesn't get that benefit.
   fixed version) isolate the two halves of a `get`.
 - **Transactions:** `--mode txn` also reports attempts per transaction and where the time
   went (backoff, read version, reads, commit), for all, the slowest 1% and slowest 0.1%.
+- **Where commits spend time:** each proxy logs, every 5 s, its batches, transactions per
+  batch, and per-batch averages/maxima of time queued at the proxy, time to resolution and
+  time until the logs and master declare the batch committed. `bench` prints the client
+  side: transactions per commit batch, time queued in the client and batch round trip.
 - **Client threads:** benchmark tasks run on the client's I/O threads (`--executor loop`,
   the default; `global` runs them on Swift's default executor). `--threads` sets how many.
 - **CPU per operation:** `scripts/cpu-per-op.sh` divides server CPU (all processes) and
@@ -119,6 +123,7 @@ Measured locally at 32 clients unless noted (`scripts/cpu-per-op.sh`, per-proces
 | One-way pushes | Logs acknowledged every push to the proxy, which never used the reply (completion comes from the master); now they answer only to refuse, and unacknowledged batches are re-pushed | −3 messages per batch |
 | One idempotency record per commit batch | Every idempotent op stored its own record for 10 minutes (tens of millions of keys at sustained write rates); now one record lists a batch's operations | storage writes per set halved; idempotency memory ÷ ~10 |
 | `tlogNeed` instead of superseding peeks | A read arriving just before its version's data cancelled the storage server's peek and started another (3 messages); now it raises the held peek's need (1 message) | txn 31k → 35k ops/s, p99 2.35 → 1.31 ms |
+| Streaming log → storage delivery | A peek is a subscription: the log keeps sending replies (with the version each continues from) instead of each reply being followed by a new peek; storage applies only gap-free continuations | server CPU per set 46 → 36 µs (logs −23%, storage −39%), per txn −13% |
 | Logs release popped data | GC was held back by the metadata tag (advances once per generation), so logs kept everything | bounded log memory (was 0.5–0.9 GB after minutes) |
 
 In k3s, these took 32-client get/set/txn from 85k/24k/10.6k to 115k/40k/17.4k ops/s and
@@ -149,7 +154,11 @@ In k3s, these took 32-client get/set/txn from 85k/24k/10.6k to 115k/40k/17.4k op
   the node used 2.2 of 4 cores and no pod was saturated (master+proxy 0.47 core, each log
   0.26). A set's p50 is 0.22 ms with one client but 0.78 ms with 32, so most of it is
   queueing in the single-threaded master/proxy and log event loops, not network hops.
-  Next lever: less work on those loops' critical path (e.g. answering storage peeks and
-  durability reports off the push path), measured per event, not per op.
+  Measured split of a 32-client set (p50 0.79 ms): 162 µs waiting in the client for one of
+  its 4 commit-batch slots, and a 581 µs batch round trip, of which 365 µs inside the
+  proxy, logs and master (logs → master 301 µs, vs 110 µs with one client). Flushing
+  commit-path messages immediately instead of at the end of each event-loop pass made it
+  worse (sets 37k → 29k/s): on this VM a syscall or packet costs more than the wait, so
+  the lever is fewer messages, hence streaming storage delivery.
 - **Single-client latency** (get 0.07 ms vs Redis 0.015 ms) is dominated by fixed per-hop
   costs in the server event loops and the client.

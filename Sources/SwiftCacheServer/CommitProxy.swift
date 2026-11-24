@@ -33,6 +33,7 @@ public final class CommitProxy: Role {
         /// Set when the commit arrived in a `commitBatch`: the reply is collective.
         var group: CommitGroup? = nil
         var index = 0
+        var arrived: UInt64 = 0
     }
 
     /// The commits of one `commitBatch`, answered together once all are decided.
@@ -71,6 +72,8 @@ public final class CommitProxy: Role {
         var committed = false
         var push: TLogPush?
         var pushedAt: UInt64 = 0
+        var startedAt: UInt64 = 0
+        var resolvedAt: UInt64 = 0
         var replies: [(pending: Pending, result: CommitResult)] = []
         var hasData = false
         init(num: UInt64, txns: [Pending], meta: [Pending]) { self.num = num; self.txns = txns; self.meta = meta }
@@ -95,6 +98,11 @@ public final class CommitProxy: Role {
 
     private var statBatches = 0
     private var statTxns = 0
+    /// Per-batch phase times (µs), summed and max, for the stats line.
+    private var statWait = (sum: UInt64(0), max: UInt64(0))
+    private var statResolve = (sum: UInt64(0), max: UInt64(0))
+    private var statDurable = (sum: UInt64(0), max: UInt64(0))
+    private var statDone = 0
 
     public func start() {
         context.ready()
@@ -102,9 +110,14 @@ public final class CommitProxy: Role {
         context.every(config.requestTimeout / 4) { [weak self] in self?.repushStale() }
         context.every(5_000_000) { [weak self] in
             guard let self, self.statBatches > 0 else { return }
-            self.context.log(.debug, "stats: \(self.statBatches) batches, \(self.statTxns) txns (\(self.statTxns / max(1, self.statBatches)) per batch)")
+            let n = UInt64(max(1, self.statDone)), t = UInt64(max(1, self.statTxns))
+            self.context.log(.info, "stats: \(self.statBatches) batches, \(self.statTxns) txns (\(self.statTxns / max(1, self.statBatches)) per batch); "
+                + "µs avg/max: queued \(self.statWait.sum / t)/\(self.statWait.max), resolve \(self.statResolve.sum / n)/\(self.statResolve.max), "
+                + "logs+master \(self.statDurable.sum / n)/\(self.statDurable.max)")
             self.statBatches = 0
             self.statTxns = 0
+            self.statDone = 0
+            self.statWait = (0, 0); self.statResolve = (0, 0); self.statDurable = (0, 0)
         }
     }
 
@@ -181,6 +194,8 @@ public final class CommitProxy: Role {
     }
 
     private func enqueue(_ p: Pending, startIfIdle: Bool = true) {
+        var p = p
+        p.arrived = context.now
         if let error = validate(p.request, from: p.client) {
             reply(p, .failed(error))
             return
@@ -216,6 +231,11 @@ public final class CommitProxy: Role {
         requestNum += 1
         statBatches += 1
         statTxns += b.txns.count
+        b.startedAt = context.now
+        for t in b.txns {
+            let w = b.startedAt &- t.arrived
+            statWait.sum += w; statWait.max = max(statWait.max, w)
+        }
         batches.append(b)
         lastBatchAt = context.now
         versionAndResolve(b)
@@ -255,6 +275,7 @@ public final class CommitProxy: Role {
                 b.version = r.version
                 b.prevVersion = r.prevVersion
                 b.resolution = r
+                b.resolvedAt = self.context.now
                 self.finalizeReady()
             case .errorReply(_, .staleGeneration)?:
                 self.generationEnded("master or resolver gone")
@@ -388,6 +409,10 @@ public final class CommitProxy: Role {
             guard b.finalized, b.version <= knownCommitted else { break }
             for r in b.replies { reply(r.pending, r.result) }
             b.committed = true
+            let resolve = b.resolvedAt &- b.startedAt, durable = context.now &- b.resolvedAt
+            statResolve.sum += resolve; statResolve.max = max(statResolve.max, resolve)
+            statDurable.sum += durable; statDurable.max = max(statDurable.max, durable)
+            statDone += 1
             done += 1
         }
         if done > 0 {

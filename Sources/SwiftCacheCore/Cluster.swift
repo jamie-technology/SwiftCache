@@ -392,10 +392,16 @@ public struct PeekReply: Hashable, Sendable, WireCodable {
     public var entries: [PeekEntry]
     /// The stream is complete up to here (entries may be empty).
     public var end: Version
-    public init(status: Status, entries: [PeekEntry], end: Version) { self.status = status; self.entries = entries; self.end = end }
-    public func encode(to w: inout WireWriter) { w.u8(status.rawValue); w.put(entries); w.u64(end) }
+    /// This reply continues the stream from here: it holds everything in (begin, end]. A
+    /// consumer applies it only if it has applied through `begin` (peeks stream several
+    /// replies per request, so a lost one must show up as a gap, not be skipped).
+    public var begin: Version
+    public init(status: Status, entries: [PeekEntry], end: Version, begin: Version = 0) {
+        self.status = status; self.entries = entries; self.end = end; self.begin = begin
+    }
+    public func encode(to w: inout WireWriter) { w.u8(status.rawValue); w.put(entries); w.u64(end); w.u64(begin) }
     public init(from r: inout WireReader) throws {
-        status = Status(rawValue: try r.u8()) ?? .stopped; entries = try r.getArray(); end = try r.u64()
+        status = Status(rawValue: try r.u8()) ?? .stopped; entries = try r.getArray(); end = try r.u64(); begin = try r.u64()
     }
 }
 

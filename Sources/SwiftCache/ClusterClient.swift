@@ -115,13 +115,27 @@ final class ClusterClient: Sendable {
         init(grv: Coalescer<Int, Version>) { self.grv = grv }
     }
     private let lanes: [Lane]
+
+    /// Commit and read batching statistics, summed over lanes and servers.
+    var batchingStats: (commits: Coalescer<CommitRequest, CommitResult>.Stats, reads: Coalescer<ReadItem, ReadResult>.Stats) {
+        var c = Coalescer<CommitRequest, CommitResult>.Stats(), r = Coalescer<ReadItem, ReadResult>.Stats()
+        for lane in lanes {
+            for x in lane.commits.withLock({ Array($0.values) }).map(\.stats) {
+                c.items += x.items; c.batches += x.batches; c.queued += x.queued; c.roundTrip += x.roundTrip
+            }
+            for x in lane.reads.withLock({ Array($0.values) }).map(\.stats) {
+                r.items += x.items; r.batches += x.batches; r.queued += x.queued; r.roundTrip += x.roundTrip
+            }
+        }
+        return (c, r)
+    }
     private var lane: Lane { lanes[transport.currentLane()] }
 
     private func commitCoalescer(_ endpoint: Endpoint) -> Coalescer<CommitRequest, CommitResult> {
         lane.commits.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 4) { reqs, done in
+            let c = Coalescer<CommitRequest, CommitResult>(maxBatch: 512, maxInFlight: 4, now: { transport.now() }) { reqs, done in
                 transport.send(to: endpoint, timeout: timeout, { .commitBatch(rid: $0, reqs) }) { result in
                     switch result {
                     case .success(.commitBatchReply(_, let results)) where results.count == reqs.count:
@@ -145,7 +159,7 @@ final class ClusterClient: Sendable {
         lane.reads.withLock { all in
             if let c = all[endpoint] { return c }
             let transport = self.transport, timeout = self.options.requestTimeout
-            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 4) { items, done in
+            let c = Coalescer<ReadItem, ReadResult>(maxBatch: 256, maxInFlight: 4, now: { transport.now() }) { items, done in
                 transport.send(to: endpoint, timeout: timeout, { .readBatch(rid: $0, items: items) }) { result in
                     switch result {
                     case .success(.readBatchReply(_, let results)) where results.count == items.count:
