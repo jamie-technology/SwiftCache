@@ -135,13 +135,36 @@ Measured locally at 32 clients unless noted (`scripts/cpu-per-op.sh`, per-proces
 In k3s, these took 32-client get/set/txn from 85k/24k/10.6k to 115k/40k/17.4k ops/s and
 256-client from 197k/67k/26k to 322k/112k/49k.
 
+### Performance V (November 2026)
+
+Profiles (`xctrace` Time Profiler on the local cluster, 32-client sets) showed both the
+master/proxy process and each log spending 30–42% of their CPU in `write`/`read`/`kevent`
+syscalls; frame encoding and decoding was ~10%. Syscalls scale with messages, and messages
+with commit batches: locally the proxy was running ~2,400 batches/s of only 2–4
+transactions, because it started a new batch as soon as the previous one was resolved
+(~50 µs) while logs and master took ~200 µs, keeping ~4 tiny batches in flight.
+
+| Change | Why it helped | Effect |
+| --- | --- | --- |
+| One commit batch in flight per proxy (`maxInflightBatches` 8 → 1) | While logs and master work on a batch, arrivals accumulate into the next, so messages and syscalls per transaction drop. A scheduling change only: batch contents and ordering are unchanged | local, 32 clients: server CPU per set 51 → 35 µs, sets +12%, txns +14% (CPU per txn 137 → 109 µs); 256 clients: sets 170k → 199k/s; k3s: neutral (batches there were already 20–70 transactions, since each hop takes 200–400 µs) |
+| Per-connection endpoint interning | Frames named `from`/`to` with 30–60-byte strings, decoded into new heap strings each time; now each endpoint is defined once per connection and referenced by a 2-byte number | ~70 fewer bytes per frame. No measurable CPU or throughput change (locally or in k3s); kept for multi-node networks, where bytes per message matter at 100k+ ops/s |
+
+Measured, then: in-flight cap 1 vs 2 vs 4 vs 8 (32 clients, local): sets 66.9k / 67.7k /
+62.1k / 59.5k, server µs per set 34.7 / 44.3 / 50.2 / 51.4.
+
+Benchmarking hazard: a transaction run started right after heavy set runs measured about
+half its steady rate (36–40k vs 72k at 256 clients, locally) while storage caught up. Run
+each mode on a freshly started cluster, or let it settle, before comparing.
+
 ### What's next
 
 - **Writes at low and medium concurrency** are latency-bound: a set is
   client → proxy → 3 logs → master → client, each hop an event-loop wakeup and syscalls on
   a shared 4-vCPU VM. Streaming log → storage delivery is done (+23% sets at 32
-  clients). Remaining levers: larger commit batches at medium load, and per-message cost (frames carry two endpoint strings that are decoded and hashed on
-  every message).
+  clients). In k3s, commit batches are already 20–70
+  transactions and per-message CPU isn't the limit (Performance V): a 32-client set is
+  latency-bound by Little's law (32 / 0.66 ms ≈ 48k/s), about 150 µs per network hop on
+  this VM. The remaining lever is fewer or cheaper hops on the write path.
 - **Tried and rejected (measured locally, Performance III):**
   - *Overlapping a transaction's read version with its first read* (adopting a replica's
     latest version). Without waiting for the read version: +30% transactions/s with one

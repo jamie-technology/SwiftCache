@@ -164,7 +164,8 @@ public final class NIOClientTransport: ClientTransport, @unchecked Sendable {
     /// Writes a request frame; write and flush bookkeeping happen on the channel's loop, so
     /// a write is always followed by a flush and writes from many tasks share one flush.
     private func write(_ message: Message, rid: UInt64, endpoint: Endpoint, conn: Connection, ch: any Channel) {
-        let frame = encodeFrame(Frame(from: laneEndpoints[conn.lane], to: endpoint, message: message), allocator: ch.allocator)
+        // Encoded by the channel's FrameEncoder, on its loop, in write order.
+        let frame = Frame(from: laneEndpoints[conn.lane], to: endpoint, message: message)
         let loop = ch.eventLoop
         @Sendable func onLoop() {
             ch.write(frame).whenFailure { err in

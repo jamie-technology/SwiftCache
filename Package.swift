@@ -76,5 +76,10 @@ let package = Package(
         .testTarget(name: "SwiftCacheCoreTests", dependencies: ["SwiftCacheCore", "SwiftCacheServer"], swiftSettings: swiftSettings),
         .testTarget(name: "SwiftCacheSimTests", dependencies: ["SwiftCacheSim"], swiftSettings: swiftSettings),
         .testTarget(name: "SwiftCacheClientTests", dependencies: ["SwiftCache"], swiftSettings: swiftSettings),
+        .testTarget(
+            name: "SwiftCacheNetTests",
+            dependencies: ["SwiftCacheNet", .product(name: "NIOEmbedded", package: "swift-nio")],
+            swiftSettings: swiftSettings
+        ),
     ]
 )

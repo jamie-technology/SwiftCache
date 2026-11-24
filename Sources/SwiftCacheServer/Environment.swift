@@ -51,7 +51,11 @@ public struct ClusterConfig: Sendable, Hashable {
     // Commit pipeline.
     public var batchInterval: UInt64 = 1_000
     public var idleBatchInterval: UInt64 = 10_000
-    public var maxInflightBatches = 8
+    /// Batches a proxy has pushed that aren't yet committed. One is best measured: while
+    /// the logs and master work on a batch, arrivals accumulate into the next one, so
+    /// messages (and syscalls) per transaction drop. Locally at 32 clients, server CPU per
+    /// set fell 51 -> 35 µs with sets +12%; at 256 clients sets went 170k -> 199k/s.
+    public var maxInflightBatches = 1
     public var maxTransactionsPerBatch = 2_000
 
     // Coordination and failure detection.

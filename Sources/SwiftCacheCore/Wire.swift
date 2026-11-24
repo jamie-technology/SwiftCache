@@ -13,7 +13,10 @@ public struct WireWriter: Sendable {
     public mutating func i32(_ v: Int32) { u32(UInt32(bitPattern: v)) }
     public mutating func i64(_ v: Int64) { u64(UInt64(bitPattern: v)) }
     public mutating func blob(_ v: Bytes) { u32(UInt32(v.count)); bytes.append(contentsOf: v) }
-    public mutating func string(_ v: String) { blob(Bytes(v.utf8)) }
+    public mutating func string(_ v: String) {
+        u32(UInt32(v.utf8.count))
+        bytes.append(contentsOf: v.utf8)
+    }
     public mutating func optionalBlob(_ v: Bytes?) {
         if let v { bool(true); blob(v) } else { bool(false) }
     }

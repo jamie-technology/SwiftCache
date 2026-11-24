@@ -22,7 +22,7 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
     var process: (any ProcessNode)?
 
     private enum Outbound {
-        case connecting([ByteBuffer])
+        case connecting([Frame])
         case ready(any Channel)
     }
     private var outbound: [Endpoint: Outbound] = [:]
@@ -33,8 +33,8 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
     private var dirty: [ObjectIdentifier: any Channel] = [:]
     private var flushScheduled = false
 
-    private func write(_ buf: ByteBuffer, to ch: any Channel) {
-        ch.write(buf, promise: nil)
+    private func write(_ frame: Frame, to ch: any Channel) {
+        ch.write(frame, promise: nil)
         dirty[ObjectIdentifier(ch)] = ch
         guard !flushScheduled else { return }
         flushScheduled = true
@@ -100,7 +100,9 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
     // MARK: Inbound
 
     private func inbound(_ channel: any Channel, _ frame: Frame) {
-        if frame.from.hasPrefix("client:") { clientChannels[frame.from] = channel }
+        // A client endpoint is (re)defined on each connection it uses, so registering on
+        // definition tracks the client's current connection without a lookup per frame.
+        if frame.fromIsNew, frame.from.hasPrefix("client:") { clientChannels[frame.from] = channel }
         process?.receive(frame.message, from: frame.from, to: frame.to)
     }
 
@@ -120,9 +122,8 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
 
     public func send(_ message: Message, from: Endpoint, to: Endpoint) {
         loop.preconditionInEventLoop()
-        let buf = encodeFrame(Frame(from: from, to: to, message: message), allocator: ByteBufferAllocator())
         if to.hasPrefix("client:") {
-            if let ch = clientChannels[to.processAddress] { write(buf, to: ch) }
+            if let ch = clientChannels[to.processAddress] { write(Frame(from: from, to: to, message: message), to: ch) }
             return
         }
         let dest = to.processAddress
@@ -131,19 +132,20 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
             loop.execute { [self] in self.process?.receive(message, from: from, to: to) }
             return
         }
+        let frame = Frame(from: from, to: to, message: message)
         switch outbound[dest] {
         case .ready(let ch)?:
-            write(buf, to: ch)
+            write(frame, to: ch)
         case .connecting(var queue)?:
-            queue.append(buf)
+            queue.append(frame)
             outbound[dest] = .connecting(queue)
         case nil:
             if let until = downUntil[dest], until > .now() { return }  // drop, like a lost packet
-            dial(dest, first: buf)
+            dial(dest, first: frame)
         }
     }
 
-    private func dial(_ dest: Endpoint, first: ByteBuffer) {
+    private func dial(_ dest: Endpoint, first: Frame) {
         guard let (host, port) = parseEndpoint(dest) else {
             log(.warning, "cannot route to \(dest)")
             return
@@ -166,7 +168,7 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
                 switch result {
                 case .success(let ch):
                     if case .connecting(let queue)? = self.outbound[dest] {
-                        for b in queue { ch.write(b, promise: nil) }
+                        for f in queue { ch.write(f, promise: nil) }
                     }
                     ch.flush()
                     self.outbound[dest] = .ready(ch)
