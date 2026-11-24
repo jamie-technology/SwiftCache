@@ -31,17 +31,23 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
     /// Channels written to during this event-loop pass; flushed once at the end, so many
     /// messages to one destination share a syscall and a packet.
     private var dirty: [ObjectIdentifier: any Channel] = [:]
+    /// Client connections written to this pass: flushed first. A flush is a syscall that
+    /// can cost ~10 µs on a bridged pod network, and replies to clients are what someone
+    /// is waiting on (e.g. a commit's reply shouldn't queue behind its log notices).
+    private var dirtyClients: [ObjectIdentifier: any Channel] = [:]
     private var flushScheduled = false
 
-    private func write(_ frame: Frame, to ch: any Channel) {
+    private func write(_ frame: Frame, to ch: any Channel, client: Bool = false) {
         ch.write(frame, promise: nil)
-        dirty[ObjectIdentifier(ch)] = ch
+        if client { dirtyClients[ObjectIdentifier(ch)] = ch } else { dirty[ObjectIdentifier(ch)] = ch }
         guard !flushScheduled else { return }
         flushScheduled = true
         loop.execute { [self] in
             self.flushScheduled = false
-            let chans = self.dirty
+            let clients = self.dirtyClients, chans = self.dirty
+            self.dirtyClients = [:]
             self.dirty = [:]
+            for ch in clients.values { ch.flush() }
             for ch in chans.values { ch.flush() }
         }
     }
@@ -102,7 +108,7 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
     private func inbound(_ channel: any Channel, _ frame: Frame) {
         // A client endpoint is (re)defined on each connection it uses, so registering on
         // definition tracks the client's current connection without a lookup per frame.
-        if frame.fromIsNew, frame.from.hasPrefix("client:") { clientChannels[frame.from] = channel }
+        if frame.fromIsNew, frame.from.isClientEndpoint { clientChannels[frame.from] = channel }
         process?.receive(frame.message, from: frame.from, to: frame.to)
     }
 
@@ -135,11 +141,11 @@ public final class NodeHost: ProcessEnvironment, @unchecked Sendable {
 
     private func send(_ message: Message, from: Endpoint, to: Endpoint, encoded: Bytes?) {
         loop.preconditionInEventLoop()
-        if to.hasPrefix("client:") {
+        if to.isClientEndpoint {
             if let ch = clientChannels[to.processAddress] {
                 var frame = Frame(from: from, to: to, message: message)
                 frame.encodedMessage = encoded
-                write(frame, to: ch)
+                write(frame, to: ch, client: true)
             }
             return
         }

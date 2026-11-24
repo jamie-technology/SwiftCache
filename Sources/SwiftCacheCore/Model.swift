@@ -7,9 +7,14 @@ public typealias Endpoint = String
 extension String {
     /// The process (network) address of an endpoint: everything before `#`.
     public var processAddress: String {
-        if let i = firstIndex(of: "#") { return String(self[..<i]) }
-        return self
+        // Byte search: `firstIndex(of: Character)` runs grapheme breaking per character,
+        // and this is on every message's path.
+        guard let i = utf8.firstIndex(of: UInt8(ascii: "#")) else { return self }
+        return String(self[..<i])
     }
+
+    /// Whether this is a client endpoint (`client:...`), by byte comparison.
+    public var isClientEndpoint: Bool { utf8.starts(with: "client:".utf8) }
 }
 
 /// Error codes that travel over the wire.
